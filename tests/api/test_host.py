@@ -16,7 +16,7 @@ from tests.dbus_service_mocks.base import DBusServiceMock
 from tests.dbus_service_mocks.systemd import Systemd as SystemdService
 
 DEFAULT_RANGE = "entries=:-99:100"
-DEFAULT_RANGE_FOLLOW = "entries=:-99:"
+DEFAULT_RANGE_FOLLOW = "entries=:-99:18446744073709551615"
 # pylint: disable=protected-access
 
 
@@ -355,11 +355,11 @@ async def test_advanced_logs_formatters(
     journal_logs_reader.assert_called_once_with(ANY, LogFormatter.VERBOSE)
 
 
-async def test_advanced_logs_errors(api_client: TestClient):
+async def test_advanced_logs_errors(coresys: CoreSys, api_client: TestClient):
     """Test advanced logging API errors."""
-    # coresys = coresys_logs_control
     with patch("supervisor.host.logs.SYSTEMD_JOURNAL_GATEWAYD_SOCKET") as socket:
         socket.is_socket.return_value = False
+        await coresys.host.logs.post_init()
         resp = await api_client.get("/host/logs")
         assert resp.content_type == "text/plain"
         assert resp.status == 400
