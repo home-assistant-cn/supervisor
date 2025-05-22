@@ -130,7 +130,9 @@ class CoreSys:
                 resolver._resolver.nameservers,
             )
         except AresError as err:
-            _LOGGER.exception("Unable to initialize async DNS resolver: %s", err)
+            _LOGGER.critical(
+                "Unable to initialize async DNS resolver: %s", err, exc_info=True
+            )
             resolver = aiohttp.ThreadedResolver(loop=self.loop)
 
         connector = aiohttp.TCPConnector(loop=self.loop, resolver=resolver)
@@ -165,7 +167,7 @@ class CoreSys:
     @property
     def dev(self) -> bool:
         """Return True if we run dev mode."""
-        return bool(os.environ.get(ENV_SUPERVISOR_DEV, 0))
+        return bool(os.environ.get(ENV_SUPERVISOR_DEV) == "1")
 
     @property
     def timezone(self) -> str:
