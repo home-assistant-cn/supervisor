@@ -630,7 +630,7 @@ class CoreSys:
     def call_later(
         self,
         delay: float,
-        funct: Callable[..., Coroutine[Any, Any, T]],
+        funct: Callable[..., Any],
         *args: tuple[Any],
         **kwargs: dict[str, Any],
     ) -> asyncio.TimerHandle:
@@ -643,7 +643,7 @@ class CoreSys:
     def call_at(
         self,
         when: datetime,
-        funct: Callable[..., Coroutine[Any, Any, T]],
+        funct: Callable[..., Any],
         *args: tuple[Any],
         **kwargs: dict[str, Any],
     ) -> asyncio.TimerHandle:
@@ -673,7 +673,7 @@ class CoreSysAttributes:
 
     @property
     def sys_machine_id(self) -> str | None:
-        """Return machine id."""
+        """Return machine ID."""
         return self.coresys.machine_id
 
     @property
@@ -843,7 +843,7 @@ class CoreSysAttributes:
     def sys_call_later(
         self,
         delay: float,
-        funct: Callable[..., Coroutine[Any, Any, T]],
+        funct: Callable[..., Any],
         *args,
         **kwargs,
     ) -> asyncio.TimerHandle:
@@ -853,7 +853,7 @@ class CoreSysAttributes:
     def sys_call_at(
         self,
         when: datetime,
-        funct: Callable[..., Coroutine[Any, Any, T]],
+        funct: Callable[..., Any],
         *args,
         **kwargs,
     ) -> asyncio.TimerHandle:
