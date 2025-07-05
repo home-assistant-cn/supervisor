@@ -294,8 +294,8 @@ class DockerAPI:
     def run_command(
         self,
         image: str,
-        tag: str = "latest",
-        command: str | None = None,
+        version: str = "latest",
+        command: str | list[str] | None = None,
         **kwargs: Any,
     ) -> CommandReturn:
         """Create a temporary container and run command.
@@ -305,12 +305,15 @@ class DockerAPI:
         stdout = kwargs.get("stdout", True)
         stderr = kwargs.get("stderr", True)
 
-        _LOGGER.info("Runing command '%s' on %s", command, image)
+        image_with_tag = f"{image}:{version}"
+
+        _LOGGER.info("Runing command '%s' on %s", command, image_with_tag)
         container = None
         try:
             container = self.docker.containers.run(
-                f"{image}:{tag}",
+                image_with_tag,
                 command=command,
+                detach=True,
                 network=self.network.name,
                 use_config_proxy=False,
                 **kwargs,
@@ -327,9 +330,9 @@ class DockerAPI:
             # cleanup container
             if container:
                 with suppress(docker_errors.DockerException, requests.RequestException):
-                    container.remove(force=True)
+                    container.remove(force=True, v=True)
 
-        return CommandReturn(result.get("StatusCode"), output)
+        return CommandReturn(result["StatusCode"], output)
 
     def repair(self) -> None:
         """Repair local docker overlayfs2 issues."""
@@ -442,7 +445,7 @@ class DockerAPI:
         if remove_container:
             with suppress(DockerException, requests.RequestException):
                 _LOGGER.info("Cleaning %s application", name)
-                docker_container.remove(force=True)
+                docker_container.remove(force=True, v=True)
 
     def start_container(self, name: str) -> None:
         """Start Docker container."""
