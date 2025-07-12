@@ -19,7 +19,7 @@ jobs:
         id: latest_frontend_version
         uses: abatilo/release-info-action@v1.3.3
         with:
-          owner: home-assistant
+          owner: home-assistant-cn
           repo: frontend
       - name: Check if version is up to date
         id: check_version
