@@ -21,7 +21,7 @@ from ..exceptions import (
     HassOSSlotUpdateError,
     HassOSUpdateError,
 )
-from ..jobs.const import JobCondition, JobExecutionLimit
+from ..jobs.const import JobConcurrency, JobCondition
 from ..jobs.decorator import Job
 from ..resolution.const import UnhealthyReason
 from ..utils.sentry import async_capture_exception
@@ -109,6 +109,11 @@ class OSManager(CoreSysAttributes):
     def latest_version(self) -> AwesomeVersion | None:
         """Return version of HassOS."""
         return self.sys_updater.version_hassos
+
+    @property
+    def latest_version_unrestricted(self) -> AwesomeVersion | None:
+        """Return current latest version of HassOS for board ignoring upgrade restrictions."""
+        return self.sys_updater.version_hassos_unrestricted
 
     @property
     def need_update(self) -> bool:
@@ -277,8 +282,8 @@ class OSManager(CoreSysAttributes):
             JobCondition.RUNNING,
             JobCondition.SUPERVISOR_UPDATED,
         ],
-        limit=JobExecutionLimit.ONCE,
         on_condition=HassOSJobError,
+        concurrency=JobConcurrency.REJECT,
     )
     async def update(self, version: AwesomeVersion | None = None) -> None:
         """Update HassOS system."""
