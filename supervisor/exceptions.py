@@ -556,6 +556,18 @@ class DockerNotFound(DockerError):
     """Docker object don't Exists."""
 
 
+class DockerLogOutOfOrder(DockerError):
+    """Raise when log from docker action was out of order."""
+
+
+class DockerNoSpaceOnDevice(DockerError):
+    """Raise if a docker pull fails due to available space."""
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__("No space left on disk", logger=logger)
+
+
 class DockerJobError(DockerError, JobException):
     """Error executing docker job."""
 

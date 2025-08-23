@@ -231,6 +231,9 @@ class Core(CoreSysAttributes):
         # Mark booted partition as healthy
         await self.sys_os.mark_healthy()
 
+        # Refresh update information
+        await self.sys_updater.reload()
+
         # On release channel, try update itself if auto update enabled
         if self.sys_supervisor.need_update and self.sys_updater.auto_update:
             if not self.healthy:
@@ -301,7 +304,6 @@ class Core(CoreSysAttributes):
 
             # Upate Host/Deivce information
             self.sys_create_task(self.sys_host.reload())
-            self.sys_create_task(self.sys_updater.reload())
             self.sys_create_task(self.sys_resolution.healthcheck())
 
             await self.set_state(CoreState.RUNNING)
@@ -392,6 +394,19 @@ class Core(CoreSysAttributes):
 
     async def _adjust_system_datetime(self) -> None:
         """Adjust system time/date on startup."""
+        # Ensure host system timezone matches supervisor timezone configuration
+        if (
+            self.sys_config.timezone
+            and self.sys_host.info.timezone != self.sys_config.timezone
+            and self.sys_dbus.timedate.is_connected
+        ):
+            _LOGGER.info(
+                "Timezone in Supervisor config '%s' differs from host '%s'",
+                self.sys_config.timezone,
+                self.sys_host.info.timezone,
+            )
+            await self.sys_host.control.set_timezone(self.sys_config.timezone)
+
         # If no timezone is detect or set
         # If we are not connected or time sync
         if (
@@ -413,7 +428,9 @@ class Core(CoreSysAttributes):
             _LOGGER.warning("Can't adjust Time/Date settings: %s", err)
             return
 
-        await self.sys_config.set_timezone(self.sys_config.timezone or data.timezone)
+        timezone = self.sys_config.timezone or data.timezone
+        await self.sys_config.set_timezone(timezone)
+        await self.sys_host.control.set_timezone(timezone)
 
         # Calculate if system time is out of sync
         delta = data.dt_utc - utcnow()
