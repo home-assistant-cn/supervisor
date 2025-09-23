@@ -488,6 +488,7 @@ async def tmp_supervisor_data(coresys: CoreSys, tmp_path: Path) -> Path:
         coresys.config.path_addon_configs.mkdir(parents=True)
         coresys.config.path_ssl.mkdir()
         coresys.config.path_core_backup.mkdir(parents=True)
+        coresys.config.path_cid_files.mkdir()
         yield tmp_path
 
 
@@ -803,7 +804,7 @@ async def os_available(request: pytest.FixtureRequest) -> None:
     version = (
         AwesomeVersion(request.param)
         if hasattr(request, "param")
-        else AwesomeVersion("10.2")
+        else AwesomeVersion("16.2")
     )
     with (
         patch.object(OSManager, "available", new=PropertyMock(return_value=True)),
