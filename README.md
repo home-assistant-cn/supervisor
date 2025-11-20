@@ -2,7 +2,7 @@
 支持无损切换，不会损坏您的任何数据 可以通过在HAOS shell中直接运行以下命令
 ```shell
 cd /mnt/data/
-curl -sSL https://os-artifacts.smart-assistant.cn/ha -o ha && sh ha
+curl -sSL https://os-artifacts.home-assistant.xin/ha -o ha && sh ha
 ```
 # [📚 文档](DOCS.md)
 # Home Assistant Supervisor
@@ -37,7 +37,7 @@ Home Assistant (前 Hass.io) 是一个基于容器的系统，用于管理您的
 支持无损切换，不会损坏您的任何数据 可以通过在HAOS shell中直接运行以下命令
 ```shell
 cd /mnt/data/
-curl -sSL https://os-artifacts.smart-assistant.cn/ha -o ha && sh ha
+curl -sSL https://os-artifacts.home-assistant.xin/ha -o ha && sh ha
 ```
 # [📚 文档](DOCS.md)
 # Home Assistant Supervisor
