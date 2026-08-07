@@ -211,6 +211,33 @@ jobs:
           push: ${{ needs.init.outputs.publish == 'true' }}
           version: ${{ needs.init.outputs.version }}
 
+      # Push to Aliyun ACR (Chinese mirror)
+      - name: Login to cn Container Registry
+        if: needs.init.outputs.publish == 'true'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ secrets.CN_REGISTRY }}
+          username: ${{ secrets.CN_REGISTRY_USERNAME }}
+          password: ${{ secrets.CN_REGISTRY_PASSWORD }}
+
+      - name: Retag and push to cn ACR
+        if: needs.init.outputs.publish == 'true'
+        run: |
+          ALIYUN_BASE="registry.cn-hangzhou.aliyuncs.com/home-assistant-cn"
+
+          ALIYUN_VERSION="${ALIYUN_BASE}/${{ matrix.arch }}-hassio-supervisor:${{ needs.init.outputs.version }}"
+          ALIYUN_LATEST="${ALIYUN_BASE}/${{ matrix.arch }}-hassio-supervisor:latest"
+
+          docker pull ${{ matrix.image }}:${{ needs.init.outputs.version }}
+          docker tag ${{ matrix.image }}:${{ needs.init.outputs.version }} $ALIYUN_VERSION
+          docker tag ${{ matrix.image }}:${{ needs.init.outputs.version }} $ALIYUN_LATEST
+
+          echo "Pushing version tag: ${ALIYUN_VERSION}"
+          docker push ${ALIYUN_VERSION}
+
+          echo "Pushing latest tag: ${ALIYUN_LATEST}"
+          docker push ${ALIYUN_LATEST}
+
   manifest:
     name: Publish multi-arch manifest
     needs: ["init", "build"]
@@ -240,14 +267,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize git
-        uses: home-assistant/actions/helpers/git-init@master
+        uses: home-assistant-cn/actions/helpers/git-init@master
         with:
           name: ${{ secrets.GIT_NAME }}
           email: ${{ secrets.GIT_EMAIL }}
           token: ${{ secrets.GIT_TOKEN }}
 
       - name: Update version file
-        uses: home-assistant/actions/helpers/version-push@master
+        uses: home-assistant-cn/actions/helpers/version-push@master
         with:
           key: ${{ env.BUILD_NAME }}
           version: ${{ needs.init.outputs.version }}
