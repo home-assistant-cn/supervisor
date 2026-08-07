@@ -2,18 +2,15 @@
 
 import logging
 
-from docker.types import Mount
-
+from ..const import DNS_DOCKER_NAME
 from ..coresys import CoreSysAttributes
 from ..exceptions import DockerJobError
 from ..jobs.const import JobConcurrency
 from ..jobs.decorator import Job
-from .const import ENV_TIME, MOUNT_DBUS, MountType
+from .const import ENV_TIME, MOUNT_DBUS, DockerMount, MountType
 from .interface import DockerInterface
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-DNS_DOCKER_NAME: str = "hassio_dns"
 
 
 class DockerDNS(DockerInterface, CoreSysAttributes):
@@ -47,8 +44,8 @@ class DockerDNS(DockerInterface, CoreSysAttributes):
             security_opt=self.security_opt,
             environment={ENV_TIME: self.sys_timezone},
             mounts=[
-                Mount(
-                    type=MountType.BIND.value,
+                DockerMount(
+                    type=MountType.BIND,
                     source=self.sys_config.path_extern_dns.as_posix(),
                     target="/config",
                     read_only=False,

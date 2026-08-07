@@ -1,6 +1,7 @@
 """Init file for Supervisor host RESTful API."""
 
 import asyncio
+from collections.abc import Awaitable
 from contextlib import suppress
 import json
 import logging
@@ -36,7 +37,12 @@ from ..const import (
     ATTR_TIMEZONE,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import APIDBMigrationInProgress, APIError, HostLogError
+from ..exceptions import (
+    APIDBMigrationInProgress,
+    APIError,
+    HostContainerLogEpochError,
+    HostLogError,
+)
 from ..host.const import (
     PARAM_BOOT_ID,
     PARAM_FOLLOW,
@@ -99,7 +105,7 @@ class APIHost(CoreSysAttributes):
             )
 
     @api_process
-    async def info(self, request):
+    async def info(self, request: web.Request) -> dict[str, Any]:
         """Return host information."""
         return {
             ATTR_AGENT_VERSION: self.sys_dbus.agent.version,
@@ -128,7 +134,7 @@ class APIHost(CoreSysAttributes):
         }
 
     @api_process
-    async def options(self, request):
+    async def options(self, request: web.Request) -> None:
         """Edit host settings."""
         body = await api_validate(SCHEMA_OPTIONS, request)
 
@@ -139,7 +145,7 @@ class APIHost(CoreSysAttributes):
             )
 
     @api_process
-    async def reboot(self, request):
+    async def reboot(self, request: web.Request) -> None:
         """Reboot host."""
         body = await api_validate(SCHEMA_SHUTDOWN, request)
         await self._check_ha_offline_migration(force=body[ATTR_FORCE])
@@ -147,7 +153,7 @@ class APIHost(CoreSysAttributes):
         return await asyncio.shield(self.sys_host.control.reboot())
 
     @api_process
-    async def shutdown(self, request):
+    async def shutdown(self, request: web.Request) -> None:
         """Poweroff host."""
         body = await api_validate(SCHEMA_SHUTDOWN, request)
         await self._check_ha_offline_migration(force=body[ATTR_FORCE])
@@ -155,12 +161,12 @@ class APIHost(CoreSysAttributes):
         return await asyncio.shield(self.sys_host.control.shutdown())
 
     @api_process
-    def reload(self, request):
+    def reload(self, request: web.Request) -> Awaitable[None]:
         """Reload host data."""
         return asyncio.shield(self.sys_host.reload())
 
     @api_process
-    async def services(self, request):
+    async def services(self, request: web.Request) -> dict[str, Any]:
         """Return list of available services."""
         services = []
         for unit in self.sys_host.services:
@@ -175,7 +181,7 @@ class APIHost(CoreSysAttributes):
         return {ATTR_SERVICES: services}
 
     @api_process
-    async def list_boots(self, _: web.Request):
+    async def list_boots(self, _: web.Request) -> dict[str, Any]:
         """Return a list of boot IDs."""
         boot_ids = await self.sys_host.logs.get_boot_ids()
         return {
@@ -186,7 +192,7 @@ class APIHost(CoreSysAttributes):
         }
 
     @api_process
-    async def list_identifiers(self, _: web.Request):
+    async def list_identifiers(self, _: web.Request) -> dict[str, list[str]]:
         """Return a list of syslog identifiers."""
         return {ATTR_IDENTIFIERS: await self.sys_host.logs.get_identifiers()}
 
@@ -197,19 +203,20 @@ class APIHost(CoreSysAttributes):
             try:
                 return await self.sys_host.logs.get_boot_id(offset)
             except (ValueError, HostLogError) as err:
-                raise APIError() from err
+                raise APIError from err
         return possible_offset
 
     async def advanced_logs_handler(
         self,
         request: web.Request,
-        identifier: str | None = None,
+        identifier: str | list[str] | None = None,
         follow: bool = False,
         latest: bool = False,
         no_colors: bool = False,
+        default_verbose: bool = False,
     ) -> web.StreamResponse:
         """Return systemd-journald logs."""
-        log_formatter = LogFormatter.PLAIN
+        log_formatter = LogFormatter.VERBOSE if default_verbose else LogFormatter.PLAIN
         params: dict[str, Any] = {}
         if identifier:
             params[PARAM_SYSLOG_IDENTIFIER] = identifier
@@ -217,8 +224,6 @@ class APIHost(CoreSysAttributes):
             params[PARAM_SYSLOG_IDENTIFIER] = request.match_info[IDENTIFIER]
         else:
             params[PARAM_SYSLOG_IDENTIFIER] = self.sys_host.logs.default_identifiers
-            # host logs should be always verbose, no matter what Accept header is used
-            log_formatter = LogFormatter.VERBOSE
 
         if BOOTID in request.match_info:
             params[PARAM_BOOT_ID] = await self._get_boot_id(request.match_info[BOOTID])
@@ -231,15 +236,12 @@ class APIHost(CoreSysAttributes):
                     "Latest logs can only be fetched for a specific identifier."
                 )
 
-            try:
-                epoch = await self._get_container_last_epoch(identifier)
-                params["CONTAINER_LOG_EPOCH"] = epoch
-            except HostLogError as err:
-                raise APIError(
-                    f"Cannot determine CONTAINER_LOG_EPOCH of {identifier}, latest logs not available."
-                ) from err
+            epoch = await self._get_container_last_epoch(identifier)
+            params["CONTAINER_LOG_EPOCH"] = epoch
 
-        if ACCEPT in request.headers and request.headers[ACCEPT] not in [
+        accept_header = request.headers.get(ACCEPT)
+
+        if accept_header and accept_header not in [
             CONTENT_TYPE_TEXT,
             CONTENT_TYPE_X_LOG,
             "*/*",
@@ -249,8 +251,11 @@ class APIHost(CoreSysAttributes):
                 "supported for now."
             )
 
-        if "verbose" in request.query or request.headers[ACCEPT] == CONTENT_TYPE_X_LOG:
+        if "verbose" in request.query or accept_header == CONTENT_TYPE_X_LOG:
             log_formatter = LogFormatter.VERBOSE
+
+        if "no_colors" in request.query:
+            no_colors = True
 
         if "lines" in request.query:
             lines = request.query.get("lines", DEFAULT_LINES)
@@ -318,18 +323,19 @@ class APIHost(CoreSysAttributes):
     async def advanced_logs(
         self,
         request: web.Request,
-        identifier: str | None = None,
+        identifier: str | list[str] | None = None,
         follow: bool = False,
         latest: bool = False,
         no_colors: bool = False,
+        default_verbose: bool = False,
     ) -> web.StreamResponse:
         """Return systemd-journald logs. Wrapped as standard API handler."""
         return await self.advanced_logs_handler(
-            request, identifier, follow, latest, no_colors
+            request, identifier, follow, latest, no_colors, default_verbose
         )
 
     @api_process
-    async def disk_usage(self, request: web.Request) -> dict:
+    async def disk_usage(self, request: web.Request) -> dict[str, Any]:
         """Return a breakdown of storage usage for the system."""
 
         max_depth = request.query.get(ATTR_MAX_DEPTH, 1)
@@ -340,15 +346,19 @@ class APIHost(CoreSysAttributes):
 
         disk = self.sys_hardware.disk
 
-        total, used, _ = await self.sys_run_in_executor(
+        total, _, free = await self.sys_run_in_executor(
             disk.disk_usage, self.sys_config.path_supervisor
         )
+
+        # Calculate used by subtracting free makes sure we include reserved space
+        # in used space reporting.
+        used = total - free
 
         known_paths = await self.sys_run_in_executor(
             disk.get_dir_sizes,
             {
-                "addons_data": self.sys_config.path_addons_data,
-                "addons_config": self.sys_config.path_addon_configs,
+                "addons_data": self.sys_config.path_apps_data,
+                "addons_config": self.sys_config.path_app_configs,
                 "media": self.sys_config.path_media,
                 "share": self.sys_config.path_share,
                 "backup": self.sys_config.path_backup,
@@ -374,8 +384,10 @@ class APIHost(CoreSysAttributes):
             ],
         }
 
-    async def _get_container_last_epoch(self, identifier: str) -> str | None:
-        """Get Docker's internal log epoch of the latest log entry for the given identifier."""
+    async def _get_container_last_epoch(self, identifier: str | list[str]) -> str:
+        """Get Docker's internal log epoch of the latest log entry for given identifier(s)."""
+        identifiers = [identifier] if isinstance(identifier, str) else identifier
+
         try:
             async with self.sys_host.logs.journald_logs(
                 params={"CONTAINER_NAME": identifier},
@@ -385,15 +397,20 @@ class APIHost(CoreSysAttributes):
             ) as resp:
                 text = await resp.text()
         except (ClientError, TimeoutError) as err:
-            raise HostLogError(
-                "Could not get last container epoch from systemd-journal-gatewayd",
-                _LOGGER.error,
+            _LOGGER.error(
+                "Could not get last container epoch from systemd-journal-gatewayd for identifiers: %s",
+                ", ".join(identifiers),
+            )
+            raise HostContainerLogEpochError(
+                identifiers=identifiers,
             ) from err
 
         try:
             return json.loads(text.strip().split("\n")[-1])["CONTAINER_LOG_EPOCH"]
         except (json.JSONDecodeError, KeyError, IndexError) as err:
-            raise HostLogError(
-                f"Failed to parse CONTAINER_LOG_EPOCH of {identifier} container, got: {text}",
-                _LOGGER.error,
-            ) from err
+            _LOGGER.error(
+                "Failed to parse CONTAINER_LOG_EPOCH from systemd-journald response for identifiers %s: %s",
+                ", ".join(identifiers),
+                text,
+            )
+            raise HostContainerLogEpochError(identifiers=identifiers) from err

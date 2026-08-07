@@ -95,7 +95,7 @@ class PluginCli(PluginBase):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise CliError() from err
+            raise CliError from err
 
     def is_running(self) -> Awaitable[bool]:
         """Return True if Docker container is running.
@@ -123,6 +123,8 @@ class PluginCli(PluginBase):
         on_condition=CliJobError,
         throttle=JobThrottle.RATE_LIMIT,
     )
-    async def _restart_after_problem(self, state: ContainerState):
+    async def _restart_after_problem(
+        self, state: ContainerState, exit_code: int | None = None
+    ):
         """Restart unhealthy or failed plugin."""
-        return await super()._restart_after_problem(state)
+        return await super()._restart_after_problem(state, exit_code)

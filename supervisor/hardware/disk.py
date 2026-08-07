@@ -6,8 +6,6 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-from supervisor.resolution.const import UnhealthyReason
-
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
     DBusError,
@@ -115,10 +113,8 @@ class HwDisk(CoreSysAttributes):
                 _LOGGER.warning("File not found: %s", child.as_posix())
                 continue
             except OSError as err:
+                self.sys_resolution.check_oserror(err)
                 if err.errno == errno.EBADMSG:
-                    self.sys_resolution.add_unhealthy_reason(
-                        UnhealthyReason.OSERROR_BAD_MESSAGE
-                    )
                     break
                 continue
 

@@ -5,7 +5,12 @@ from dbus_fast import DBusError, Variant
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
-from supervisor.dbus.const import StartUnitMode, StopUnitMode, UnitActiveState
+from supervisor.dbus.const import (
+    StartUnitMode,
+    StopUnitMode,
+    SystemState,
+    UnitActiveState,
+)
 from supervisor.dbus.systemd import Systemd
 from supervisor.exceptions import DBusNotConnectedError, DBusSystemdNoSuchUnit
 
@@ -16,7 +21,7 @@ from tests.dbus_service_mocks.systemd import Systemd as SystemdService
 @pytest.fixture(name="systemd_service", autouse=True)
 async def fixture_systemd_service(dbus_session_bus: MessageBus) -> SystemdService:
     """Mock systemd dbus service."""
-    yield (await mock_dbus_services({"systemd": None}, dbus_session_bus))["systemd"]
+    return (await mock_dbus_services({"systemd": None}, dbus_session_bus))["systemd"]
 
 
 async def test_dbus_systemd_info(dbus_session_bus: MessageBus):
@@ -30,6 +35,19 @@ async def test_dbus_systemd_info(dbus_session_bus: MessageBus):
 
     assert systemd.boot_timestamp == 1632236713344227
     assert systemd.startup_time == 45.304696
+    assert await systemd.get_system_state() == SystemState.RUNNING
+
+
+async def test_subscribe_on_connect(
+    systemd_service: SystemdService, dbus_session_bus: MessageBus
+):
+    """Test that Subscribe is called on connect to enable signal emission."""
+    systemd_service.Subscribe.calls.clear()
+    systemd = Systemd()
+
+    await systemd.connect(dbus_session_bus)
+
+    assert systemd_service.Subscribe.calls == [()]
 
 
 async def test_reboot(systemd_service: SystemdService, dbus_session_bus: MessageBus):
@@ -151,6 +169,25 @@ async def test_list_units(dbus_session_bus: MessageBus):
     assert units[3][2] == "loaded"
 
 
+async def test_list_units_filtered(
+    systemd_service: SystemdService, dbus_session_bus: MessageBus
+):
+    """Test list units filtered by state."""
+    systemd_service.ListUnitsFiltered.calls.clear()
+    systemd = Systemd()
+
+    with pytest.raises(DBusNotConnectedError):
+        await systemd.list_units_filtered(["failed"])
+
+    await systemd.connect(dbus_session_bus)
+
+    units = await systemd.list_units_filtered(["not-found"])
+    assert len(units) == 1
+    assert units[0][0] == "firewalld.service"
+    assert units[0][2] == "not-found"
+    assert systemd_service.ListUnitsFiltered.calls == [(["not-found"],)]
+
+
 async def test_start_transient_unit(
     systemd_service: SystemdService, dbus_session_bus: MessageBus
 ):
@@ -185,10 +222,10 @@ async def test_start_transient_unit(
             "tmp-test.mount",
             "fail",
             [
-                ["Description", Variant("s", "Test")],
-                ["What", Variant("s", "//homeassistant/config")],
-                ["Type", Variant("s", "cifs")],
-                ["Options", Variant("s", "username=homeassistant,password=password")],
+                ("Description", Variant("s", "Test")),
+                ("What", Variant("s", "//homeassistant/config")),
+                ("Type", Variant("s", "cifs")),
+                ("Options", Variant("s", "username=homeassistant,password=password")),
             ],
             [],
         )

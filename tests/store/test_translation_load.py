@@ -1,21 +1,20 @@
 """Test loading add-translation."""
 
 # pylint: disable=import-error,protected-access
-import os
 from pathlib import Path
 
 import pytest
 
 from supervisor.coresys import CoreSys
-from supervisor.store.data import _read_addon_translations
+from supervisor.store.data import _read_app_translations
 from supervisor.utils.common import write_json_or_yaml_file
 
 
 def test_loading_traslations(coresys: CoreSys, tmp_path: Path):
     """Test loading add-translation."""
-    os.makedirs(tmp_path / "translations")
-    # no transaltions
-    assert _read_addon_translations(tmp_path) == {}
+    (tmp_path / "translations").mkdir(parents=True)
+    # no translations
+    assert _read_app_translations(tmp_path) == {}
 
     for file in ("en.json", "es.json"):
         write_json_or_yaml_file(
@@ -41,7 +40,7 @@ def test_loading_traslations(coresys: CoreSys, tmp_path: Path):
             },
         )
 
-    translations = _read_addon_translations(tmp_path)
+    translations = _read_app_translations(tmp_path)
 
     assert translations["en"]["configuration"]["test"]["name"] == "test"
     assert translations["es"]["configuration"]["test"]["name"] == "test"
@@ -69,7 +68,7 @@ def test_translation_file_failure(
     coresys: CoreSys, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):
     """Test translations load if one fails."""
-    os.makedirs(tmp_path / "translations")
+    (tmp_path / "translations").mkdir(parents=True)
     write_json_or_yaml_file(
         tmp_path / "translations" / "en.json",
         {"configuration": {"test": {"name": "test", "test": "test"}}},
@@ -78,7 +77,7 @@ def test_translation_file_failure(
     with fail_path.open("w") as de_file:
         de_file.write("not json")
 
-    translations = _read_addon_translations(tmp_path)
+    translations = _read_app_translations(tmp_path)
 
     assert translations["en"]["configuration"]["test"]["name"] == "test"
     assert f"Can't read translations from {fail_path.as_posix()}" in caplog.text

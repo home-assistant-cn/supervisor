@@ -10,7 +10,7 @@ import voluptuous as vol
 
 from ..const import (
     ATTR_ADDONS,
-    ATTR_ADDONS_REPOSITORIES,
+    ATTR_APPS_REPOSITORIES,
     ATTR_ARCH,
     ATTR_AUTO_UPDATE,
     ATTR_BLK_READ,
@@ -22,6 +22,7 @@ from ..const import (
     ATTR_DEBUG_BLOCK,
     ATTR_DETECT_BLOCKING_IO,
     ATTR_DIAGNOSTICS,
+    ATTR_FEATURE_FLAGS,
     ATTR_HEALTHY,
     ATTR_ICON,
     ATTR_IP_ADDRESS,
@@ -41,6 +42,7 @@ from ..const import (
     ATTR_VERSION,
     ATTR_VERSION_LATEST,
     ATTR_WAIT_BOOT,
+    FeatureFlag,
     LogLevel,
     UpdateChannel,
 )
@@ -60,7 +62,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 SCHEMA_OPTIONS = vol.Schema(
     {
         vol.Optional(ATTR_CHANNEL): vol.Coerce(UpdateChannel),
-        vol.Optional(ATTR_ADDONS_REPOSITORIES): repositories,
+        vol.Optional(ATTR_APPS_REPOSITORIES): repositories,
         vol.Optional(ATTR_TIMEZONE): str,
         vol.Optional(ATTR_WAIT_BOOT): wait_boot,
         vol.Optional(ATTR_LOGGING): vol.Coerce(LogLevel),
@@ -70,6 +72,9 @@ SCHEMA_OPTIONS = vol.Schema(
         vol.Optional(ATTR_AUTO_UPDATE): vol.Boolean(),
         vol.Optional(ATTR_DETECT_BLOCKING_IO): vol.Coerce(DetectBlockingIO),
         vol.Optional(ATTR_COUNTRY): str,
+        vol.Optional(ATTR_FEATURE_FLAGS): vol.Schema(
+            {vol.Coerce(FeatureFlag): vol.Boolean()}
+        ),
     }
 )
 
@@ -80,7 +85,7 @@ class APISupervisor(CoreSysAttributes):
     """Handle RESTful API for Supervisor functions."""
 
     @api_process
-    async def ping(self, request):
+    async def ping(self, request: web.Request) -> bool:
         """Return ok for signal that the API is ready."""
         return True
 
@@ -104,22 +109,26 @@ class APISupervisor(CoreSysAttributes):
             ATTR_AUTO_UPDATE: self.sys_updater.auto_update,
             ATTR_DETECT_BLOCKING_IO: BlockBusterManager.is_enabled(),
             ATTR_COUNTRY: self.sys_config.country,
-            # Depricated
+            ATTR_FEATURE_FLAGS: {
+                feature.value: self.sys_config.feature_flags.get(feature, False)
+                for feature in FeatureFlag
+            },
+            # Deprecated
             ATTR_WAIT_BOOT: self.sys_config.wait_boot,
             ATTR_ADDONS: [
                 {
-                    ATTR_NAME: addon.name,
-                    ATTR_SLUG: addon.slug,
-                    ATTR_VERSION: addon.version,
-                    ATTR_VERSION_LATEST: addon.latest_version,
-                    ATTR_UPDATE_AVAILABLE: addon.need_update,
-                    ATTR_STATE: addon.state,
-                    ATTR_REPOSITORY: addon.repository,
-                    ATTR_ICON: addon.with_icon,
+                    ATTR_NAME: app.name,
+                    ATTR_SLUG: app.slug,
+                    ATTR_VERSION: app.version,
+                    ATTR_VERSION_LATEST: app.latest_version,
+                    ATTR_UPDATE_AVAILABLE: app.need_update,
+                    ATTR_STATE: app.state,
+                    ATTR_REPOSITORY: app.repository,
+                    ATTR_ICON: app.with_icon,
                 }
-                for addon in self.sys_addons.local.values()
+                for app in self.sys_apps.local.values()
             ],
-            ATTR_ADDONS_REPOSITORIES: [
+            ATTR_APPS_REPOSITORIES: [
                 {ATTR_NAME: store.name, ATTR_SLUG: store.slug}
                 for store in self.sys_store.all
             ],
@@ -182,14 +191,18 @@ class APISupervisor(CoreSysAttributes):
         if ATTR_WAIT_BOOT in body:
             self.sys_config.wait_boot = body[ATTR_WAIT_BOOT]
 
-        # Save changes before processing addons in case of errors
+        if ATTR_FEATURE_FLAGS in body:
+            for feature, enabled in body[ATTR_FEATURE_FLAGS].items():
+                self.sys_config.set_feature_flag(feature, enabled)
+
+        # Save changes before processing apps in case of errors
         await self.sys_updater.save_data()
         await self.sys_config.save_data()
 
         # Remove: 2022.9
-        if ATTR_ADDONS_REPOSITORIES in body:
+        if ATTR_APPS_REPOSITORIES in body:
             await asyncio.shield(
-                self.sys_store.update_repositories(set(body[ATTR_ADDONS_REPOSITORIES]))
+                self.sys_store.update_repositories(set(body[ATTR_APPS_REPOSITORIES]))
             )
 
         await self.sys_resolution.evaluate.evaluate_system()
@@ -214,23 +227,25 @@ class APISupervisor(CoreSysAttributes):
     async def update(self, request: web.Request) -> None:
         """Update Supervisor OS."""
         body = await api_validate(SCHEMA_VERSION, request)
+        version = body.get(ATTR_VERSION)
 
-        # This option is useless outside of DEV
-        if not self.sys_dev and not self.sys_supervisor.need_update:
+        # Updating to a specific version is only possible in DEV. Without an
+        # explicit version an update is only triggered when one is actually
+        # available (in DEV need_update is always False, so a versionless
+        # request is a no-op).
+        if version is None and not self.sys_supervisor.need_update:
             raise APIError(
                 f"No supervisor update available - {self.sys_supervisor.version!s}"
             )
 
-        if self.sys_dev:
-            version = body.get(ATTR_VERSION, self.sys_updater.version_supervisor)
-        else:
+        if not self.sys_dev:
             version = self.sys_updater.version_supervisor
 
         await asyncio.shield(self.sys_supervisor.update(version))
 
     @api_process
     async def reload(self, request: web.Request) -> None:
-        """Reload add-ons, configuration, etc."""
+        """Reload apps, configuration, etc."""
         await asyncio.gather(
             asyncio.shield(self.sys_updater.reload()),
             asyncio.shield(self.sys_homeassistant.secrets.reload()),
@@ -248,6 +263,7 @@ class APISupervisor(CoreSysAttributes):
         return asyncio.shield(self.sys_supervisor.restart())
 
     @api_process_raw(CONTENT_TYPE_TEXT, error_type=CONTENT_TYPE_TEXT)
-    def logs(self, request: web.Request) -> Awaitable[bytes]:
+    async def logs(self, request: web.Request) -> bytes:
         """Return supervisor Docker logs."""
-        return self.sys_supervisor.logs()
+        logs = await self.sys_supervisor.logs()
+        return "\n".join(logs).encode(errors="replace")

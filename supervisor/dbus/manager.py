@@ -95,7 +95,7 @@ class DBusManager(CoreSysAttributes):
     def connected_bus(self) -> MessageBus:
         """Return the message bus. Raise if not connected."""
         if not self._bus:
-            raise DBusNotConnectedError()
+            raise DBusNotConnectedError
         return self._bus
 
     @property
@@ -115,7 +115,7 @@ class DBusManager(CoreSysAttributes):
 
     async def load(self) -> None:
         """Connect interfaces to D-Bus."""
-        if not SOCKET_DBUS.exists():
+        if not await self.sys_run_in_executor(SOCKET_DBUS.exists):
             _LOGGER.error(
                 "No D-Bus support on Host. Disabled any kind of host control!"
             )
@@ -158,4 +158,4 @@ class DBusManager(CoreSysAttributes):
             dbus.shutdown()
 
         self.bus.disconnect()
-        _LOGGER.info("Closed conection to system D-Bus.")
+        _LOGGER.info("Closed connection to system D-Bus.")

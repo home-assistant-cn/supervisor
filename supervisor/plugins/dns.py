@@ -5,12 +5,11 @@ Code: https://github.com/home-assistant/plugin-dns
 
 import asyncio
 from contextlib import suppress
-import errno
+from dataclasses import dataclass
 from ipaddress import IPv4Address
 import logging
 from pathlib import Path
 
-import attr
 from awesomeversion import AwesomeVersion
 import jinja2
 import voluptuous as vol
@@ -33,7 +32,7 @@ from ..exceptions import (
 )
 from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
-from ..resolution.const import ContextType, IssueType, SuggestionType, UnhealthyReason
+from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..utils.json import write_json_file
 from ..utils.sentry import async_capture_exception
 from ..validate import dns_url
@@ -56,12 +55,12 @@ RESOLV_TMPL: Path = Path(__file__).parents[1].joinpath("data/resolv.tmpl")
 HOST_RESOLV: Path = Path("/etc/resolv.conf")
 
 
-@attr.s
+@dataclass(slots=True, frozen=True)
 class HostEntry:
     """Single entry in hosts."""
 
-    ip_address: IPv4Address = attr.ib()
-    names: list[str] = attr.ib()
+    ip_address: IPv4Address
+    names: list[str]
 
 
 class PluginDns(PluginBase):
@@ -123,7 +122,10 @@ class PluginDns(PluginBase):
             await asyncio.sleep(5)
 
             _LOGGER.debug("CoreDNS started, checking connectivity")
-            await self.sys_supervisor.check_connectivity()
+            # DNS resolution has just changed; force a fresh probe so a check
+            # in flight while DNS was restarting doesn't leave us with a
+            # stale failure cached.
+            self.sys_supervisor.request_connectivity_check(force=True)
 
     async def _restart_dns_after_locals_change(self) -> None:
         """Restart DNS after a debounced delay for local changes."""
@@ -232,10 +234,7 @@ class PluginDns(PluginBase):
                 await self.sys_run_in_executor(RESOLV_TMPL.read_text, encoding="utf-8")
             )
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             _LOGGER.error("Can't read resolve.tmpl: %s", err)
 
         try:
@@ -243,10 +242,7 @@ class PluginDns(PluginBase):
                 await self.sys_run_in_executor(HOSTS_TMPL.read_text, encoding="utf-8")
             )
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             _LOGGER.error("Can't read hosts.tmpl: %s", err)
 
         await self._init_hosts()
@@ -267,7 +263,7 @@ class PluginDns(PluginBase):
         # Reinitializing aiohttp.ClientSession after DNS setup makes sure that
         # aiodns is using the right DNS servers (see #5857).
         # At this point it should be fairly safe to replace the session since
-        # we only use the session synchronously during setup and not thorugh the
+        # we only use the session synchronously during setup and not through the
         # API which previously caused issues (see #5851).
         await self.coresys.init_websession()
 
@@ -336,14 +332,17 @@ class PluginDns(PluginBase):
         await self.save_data()
 
         # Resets hosts
-        with suppress(OSError):
-            self.hosts.unlink()
+        try:
+            await self.sys_run_in_executor(self.hosts.unlink)
+        except OSError as err:
+            self.sys_resolution.check_oserror(err)
+            _LOGGER.debug("Can't remove hosts file: %s", err)
         await self._init_hosts()
 
         # Reset loop protection
         self._loop = False
 
-        await self.sys_addons.sync_dns()
+        await self.sys_apps.sync_dns()
 
     async def watchdog_container(self, event: DockerContainerStateEvent) -> None:
         """Check for loop on failure before processing state change event."""
@@ -359,16 +358,18 @@ class PluginDns(PluginBase):
         on_condition=CoreDNSJobError,
         throttle=JobThrottle.RATE_LIMIT,
     )
-    async def _restart_after_problem(self, state: ContainerState):
+    async def _restart_after_problem(
+        self, state: ContainerState, exit_code: int | None = None
+    ):
         """Restart unhealthy or failed plugin."""
-        return await super()._restart_after_problem(state)
+        return await super()._restart_after_problem(state, exit_code)
 
     async def loop_detection(self) -> None:
         """Check if there was a loop found."""
         log = await self.instance.logs()
 
         # Check the log for loop plugin output
-        if b"plugin/loop: Loop" in log:
+        if any("plugin/loop: Loop" in line for line in log):
             _LOGGER.error("Detected a DNS loop in local Network!")
             self._loop = True
             self.sys_resolution.create_issue(
@@ -448,10 +449,7 @@ class PluginDns(PluginBase):
                 self.hosts.write_text, data, encoding="utf-8"
             )
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             raise CoreDNSError(f"Can't update hosts: {err}", _LOGGER.error) from err
 
     async def add_host(
@@ -508,7 +506,7 @@ class PluginDns(PluginBase):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise CoreDNSError() from err
+            raise CoreDNSError from err
 
     async def repair(self) -> None:
         """Repair CoreDNS plugin."""
@@ -533,10 +531,7 @@ class PluginDns(PluginBase):
         try:
             await self.sys_run_in_executor(resolv_conf.write_text, data)
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             _LOGGER.warning("Can't write/update %s: %s", resolv_conf, err)
             return
 

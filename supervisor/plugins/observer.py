@@ -15,9 +15,11 @@ from ..docker.const import ContainerState
 from ..docker.observer import DockerObserver
 from ..docker.stats import DockerStats
 from ..exceptions import (
+    DockerContainerPortConflict,
     DockerError,
     ObserverError,
     ObserverJobError,
+    ObserverPortConflict,
     ObserverUpdateError,
     PluginError,
 )
@@ -87,9 +89,11 @@ class PluginObserver(PluginBase):
         _LOGGER.info("Starting observer plugin")
         try:
             await self.instance.run()
+        except DockerContainerPortConflict as err:
+            raise ObserverPortConflict(_LOGGER.error) from err
         except DockerError as err:
             _LOGGER.error("Can't start observer plugin")
-            raise ObserverError() from err
+            raise ObserverError from err
 
     async def stop(self) -> None:
         """Raise. Supervisor should not stop observer."""
@@ -100,7 +104,7 @@ class PluginObserver(PluginBase):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise ObserverError() from err
+            raise ObserverError from err
 
     async def check_system_runtime(self) -> bool:
         """Check if the observer is running."""
@@ -111,7 +115,7 @@ class PluginObserver(PluginBase):
             ) as request:
                 if request.status == 200:
                     return True
-        except (aiohttp.ClientError, TimeoutError):
+        except aiohttp.ClientError, TimeoutError:
             pass
 
         return False
@@ -135,6 +139,8 @@ class PluginObserver(PluginBase):
         on_condition=ObserverJobError,
         throttle=JobThrottle.RATE_LIMIT,
     )
-    async def _restart_after_problem(self, state: ContainerState):
+    async def _restart_after_problem(
+        self, state: ContainerState, exit_code: int | None = None
+    ):
         """Restart unhealthy or failed plugin."""
-        return await super()._restart_after_problem(state)
+        return await super()._restart_after_problem(state, exit_code)

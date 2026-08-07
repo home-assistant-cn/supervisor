@@ -21,7 +21,7 @@ async def fixture_sda1_block_service(
     udisks2_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> BlockService:
     """Return sda1 block service."""
-    yield udisks2_services["udisks2_block"][
+    return udisks2_services["udisks2_block"][
         "/org/freedesktop/UDisks2/block_devices/sda1"
     ]
 
@@ -66,13 +66,17 @@ async def test_approve(coresys: CoreSys, sda1_block_service: BlockService):
     disabled_data_disk = CheckDisabledDataDisk(coresys)
     await coresys.core.set_state(CoreState.RUNNING)
 
-    assert not await disabled_data_disk.approve_check(reference="/dev/sda1")
+    assert not await disabled_data_disk.approve_check(
+        Issue(IssueType.DISABLED_DATA_DISK, ContextType.SYSTEM, reference="/dev/sda1")
+    )
 
     sda1_block_service.fixture = replace(
         sda1_block_service.fixture, IdLabel="hassos-data-dis"
     )
 
-    assert await disabled_data_disk.approve_check(reference="/dev/sda1")
+    assert await disabled_data_disk.approve_check(
+        Issue(IssueType.DISABLED_DATA_DISK, ContextType.SYSTEM, reference="/dev/sda1")
+    )
 
 
 async def test_did_run(coresys: CoreSys):

@@ -1,15 +1,16 @@
-"""Manage SSO for Add-ons with Home Assistant user."""
+"""Manage SSO for Apps with Home Assistant user."""
 
 import asyncio
 import hashlib
 import logging
 from typing import Any, TypedDict, cast
 
-from .addons.addon import Addon
-from .const import ATTR_PASSWORD, ATTR_TYPE, ATTR_USERNAME, FILE_HASSIO_AUTH
+from .apps.app import App
+from .const import ATTR_PASSWORD, ATTR_USERNAME, FILE_HASSIO_AUTH, HomeAssistantUser
 from .coresys import CoreSys, CoreSysAttributes
 from .exceptions import (
-    AuthError,
+    AuthHomeAssistantAPIValidationError,
+    AuthInvalidNonStringValueError,
     AuthListUsersError,
     AuthPasswordResetError,
     HomeAssistantAPIError,
@@ -33,7 +34,7 @@ class BackendAuthRequest(TypedDict):
 
 
 class Auth(FileConfiguration, CoreSysAttributes):
-    """Manage SSO for Add-ons with Home Assistant user."""
+    """Manage SSO for Apps with Home Assistant user."""
 
     def __init__(self, coresys: CoreSys) -> None:
         """Initialize updater."""
@@ -80,15 +81,13 @@ class Auth(FileConfiguration, CoreSysAttributes):
         await self.save_data()
 
     async def check_login(
-        self, addon: Addon, username: str | None, password: str | None
+        self, app: App, username: str | None, password: str | None
     ) -> bool:
         """Check username login."""
-        if password is None:
-            raise AuthError("None as password is not supported!", _LOGGER.error)
-        if username is None:
-            raise AuthError("None as username is not supported!", _LOGGER.error)
+        if username is None or password is None:
+            raise AuthInvalidNonStringValueError(_LOGGER.error)
 
-        _LOGGER.info("Auth request from '%s' for '%s'", addon.slug, username)
+        _LOGGER.info("Auth request from '%s' for '%s'", app.slug, username)
 
         # Get from cache
         cache_hit = self._check_cache(username, password)
@@ -100,18 +99,18 @@ class Auth(FileConfiguration, CoreSysAttributes):
 
         # No cache hit
         if cache_hit is None:
-            return await self._backend_login(addon, username, password)
+            return await self._backend_login(app, username, password)
 
         # Home Assistant Core take over 1-2sec to validate it
         # Let's use the cache and update the cache in background
         if username not in self._running:
             self._running[username] = self.sys_create_task(
-                self._backend_login(addon, username, password)
+                self._backend_login(app, username, password)
             )
 
         return cache_hit
 
-    async def _backend_login(self, addon: Addon, username: str, password: str) -> bool:
+    async def _backend_login(self, app: App, username: str, password: str) -> bool:
         """Check username login on core."""
         try:
             async with self.sys_homeassistant.api.make_request(
@@ -120,7 +119,7 @@ class Auth(FileConfiguration, CoreSysAttributes):
                 json=cast(
                     dict[str, Any],
                     BackendAuthRequest(
-                        username=username, password=password, addon=addon.slug
+                        username=username, password=password, addon=app.slug
                     ),
                 ),
             ) as req:
@@ -137,7 +136,7 @@ class Auth(FileConfiguration, CoreSysAttributes):
         finally:
             self._running.pop(username, None)
 
-        raise AuthError()
+        raise AuthHomeAssistantAPIValidationError
 
     async def change_password(self, username: str, password: str) -> None:
         """Change user password login."""
@@ -155,26 +154,15 @@ class Auth(FileConfiguration, CoreSysAttributes):
         except HomeAssistantAPIError as err:
             _LOGGER.error("Can't request password reset on Home Assistant: %s", err)
 
-        raise AuthPasswordResetError()
+        raise AuthPasswordResetError(user=username)
 
-    async def list_users(self) -> list[dict[str, Any]]:
+    async def list_users(self) -> list[HomeAssistantUser]:
         """List users on the Home Assistant instance."""
         try:
-            users: (
-                list[dict[str, Any]] | None
-            ) = await self.sys_homeassistant.websocket.async_send_command(
-                {ATTR_TYPE: "config/auth/list"}
-            )
+            return await self.sys_homeassistant.list_users()
         except HomeAssistantWSError as err:
-            raise AuthListUsersError(
-                f"Can't request listing users on Home Assistant: {err}", _LOGGER.error
-            ) from err
-
-        if users is not None:
-            return users
-        raise AuthListUsersError(
-            "Can't request listing users on Home Assistant!", _LOGGER.error
-        )
+            _LOGGER.error("Can't request listing users on Home Assistant: %s", err)
+            raise AuthListUsersError from err
 
     @staticmethod
     def _rehash(value: str, salt2: str = "") -> str:

@@ -3,6 +3,8 @@
 from enum import IntEnum, StrEnum
 from socket import AF_INET, AF_INET6
 
+from .enum import DBusIntEnum, DBusStrEnum
+
 DBUS_NAME_HAOS = "io.hass.os"
 DBUS_NAME_HOSTNAME = "org.freedesktop.hostname1"
 DBUS_NAME_LOGIND = "org.freedesktop.login1"
@@ -24,6 +26,7 @@ DBUS_IFACE_FILESYSTEM = "org.freedesktop.UDisks2.Filesystem"
 DBUS_IFACE_HAOS = "io.hass.os"
 DBUS_IFACE_HAOS_APPARMOR = "io.hass.os.AppArmor"
 DBUS_IFACE_HAOS_BOARDS = "io.hass.os.Boards"
+DBUS_IFACE_HAOS_BOARDS_RPI_FIRMWARE = "io.hass.os.Boards.RaspberryPi.Firmware"
 DBUS_IFACE_HAOS_CGROUP = "io.hass.os.CGroup"
 DBUS_IFACE_HAOS_CONFIG_SWAP = "io.hass.os.Config.Swap"
 DBUS_IFACE_HAOS_DATADISK = "io.hass.os.DataDisk"
@@ -48,12 +51,14 @@ DBUS_SIGNAL_NM_CONNECTION_ACTIVE_CHANGED = (
 )
 DBUS_SIGNAL_PROPERTIES_CHANGED = "org.freedesktop.DBus.Properties.PropertiesChanged"
 DBUS_SIGNAL_RAUC_INSTALLER_COMPLETED = "de.pengutronix.rauc.Installer.Completed"
+DBUS_SIGNAL_SYSTEMD_JOB_REMOVED = "org.freedesktop.systemd1.Manager.JobRemoved"
 
 DBUS_OBJECT_BASE = "/"
 DBUS_OBJECT_DNS = "/org/freedesktop/NetworkManager/DnsManager"
 DBUS_OBJECT_HAOS = "/io/hass/os"
 DBUS_OBJECT_HAOS_APPARMOR = "/io/hass/os/AppArmor"
 DBUS_OBJECT_HAOS_BOARDS = "/io/hass/os/Boards"
+DBUS_OBJECT_HAOS_BOARDS_RPI_FIRMWARE = "/io/hass/os/Boards/RaspberryPi/Firmware"
 DBUS_OBJECT_HAOS_CGROUP = "/io/hass/os/CGroup"
 DBUS_OBJECT_HAOS_CONFIG_SWAP = "/io/hass/os/Config/Swap"
 DBUS_OBJECT_HAOS_DATADISK = "/io/hass/os/DataDisk"
@@ -75,6 +80,7 @@ DBUS_ATTR_ACTIVE_STATE = "ActiveState"
 DBUS_ATTR_ACTIVITY_LED = "ActivityLED"
 DBUS_ATTR_ADDRESS_DATA = "AddressData"
 DBUS_ATTR_BITRATE = "Bitrate"
+DBUS_ATTR_BLOCKED_REASON = "BlockedReason"
 DBUS_ATTR_BOARD = "Board"
 DBUS_ATTR_BOOT_SLOT = "BootSlot"
 DBUS_ATTR_CACHE_STATISTICS = "CacheStatistics"
@@ -88,6 +94,7 @@ DBUS_ATTR_CONNECTIVITY = "Connectivity"
 DBUS_ATTR_CURRENT_DEVICE = "CurrentDevice"
 DBUS_ATTR_CURRENT_DNS_SERVER = "CurrentDNSServer"
 DBUS_ATTR_CURRENT_DNS_SERVER_EX = "CurrentDNSServerEx"
+DBUS_ATTR_CURRENT_VERSION = "CurrentVersion"
 DBUS_ATTR_CONTROLLER_ID = "ControllerID"
 DBUS_ATTR_DEFAULT = "Default"
 DBUS_ATTR_DEPLOYMENT = "Deployment"
@@ -135,6 +142,7 @@ DBUS_ATTR_IP6CONFIG = "Ip6Config"
 DBUS_ATTR_KERNEL_RELEASE = "KernelRelease"
 DBUS_ATTR_KERNEL_TIMESTAMP_MONOTONIC = "KernelTimestampMonotonic"
 DBUS_ATTR_LAST_ERROR = "LastError"
+DBUS_ATTR_LATEST_VERSION = "LatestVersion"
 DBUS_ATTR_LLMNR = "LLMNR"
 DBUS_ATTR_LLMNR_HOSTNAME = "LLMNRHostname"
 DBUS_ATTR_LOADER_TIMESTAMP_MONOTONIC = "LoaderTimestampMonotonic"
@@ -189,11 +197,15 @@ DBUS_ATTR_SWAP_SIZE = "SwapSize"
 DBUS_ATTR_SWAPPINESS = "Swappiness"
 DBUS_ATTR_TABLE = "Table"
 DBUS_ATTR_TIME_DETECTED = "TimeDetected"
+DBUS_ATTR_TIMEOUT_USEC = "TimeoutUSec"
 DBUS_ATTR_TIMEUSEC = "TimeUSec"
 DBUS_ATTR_TIMEZONE = "Timezone"
 DBUS_ATTR_TRANSACTION_STATISTICS = "TransactionStatistics"
 DBUS_ATTR_TYPE = "Type"
 DBUS_ATTR_UNALLOCATED_CAPACITY = "UnallocatedCapacity"
+DBUS_ATTR_UPDATE_AVAILABLE = "UpdateAvailable"
+DBUS_ATTR_UPDATE_BLOCKED = "UpdateBlocked"
+DBUS_ATTR_UPDATE_PENDING = "UpdatePending"
 DBUS_ATTR_USER_LED = "UserLED"
 DBUS_ATTR_USERSPACE_TIMESTAMP_MONOTONIC = "UserspaceTimestampMonotonic"
 DBUS_ATTR_UUID_UPPERCASE = "UUID"
@@ -208,7 +220,7 @@ DBUS_ATTR_WWN = "WWN"
 DBUS_ERR_SYSTEMD_NO_SUCH_UNIT = "org.freedesktop.systemd1.NoSuchUnit"
 
 
-class RaucState(StrEnum):
+class RaucState(DBusStrEnum):
     """Rauc slot states."""
 
     GOOD = "good"
@@ -216,7 +228,7 @@ class RaucState(StrEnum):
     ACTIVE = "active"
 
 
-class InterfaceMethod(StrEnum):
+class InterfaceMethod(DBusStrEnum):
     """Interface method simple."""
 
     AUTO = "auto"
@@ -225,7 +237,7 @@ class InterfaceMethod(StrEnum):
     LINK_LOCAL = "link-local"
 
 
-class InterfaceAddrGenMode(IntEnum):
+class InterfaceAddrGenMode(DBusIntEnum):
     """Interface addr_gen_mode."""
 
     EUI64 = 0
@@ -234,7 +246,7 @@ class InterfaceAddrGenMode(IntEnum):
     DEFAULT = 3
 
 
-class InterfaceIp6Privacy(IntEnum):
+class InterfaceIp6Privacy(DBusIntEnum):
     """Interface ip6_privacy."""
 
     DEFAULT = -1
@@ -243,14 +255,14 @@ class InterfaceIp6Privacy(IntEnum):
     ENABLED = 2
 
 
-class ConnectionType(StrEnum):
+class ConnectionType(DBusStrEnum):
     """Connection type."""
 
     ETHERNET = "802-3-ethernet"
     WIRELESS = "802-11-wireless"
 
 
-class ConnectionStateType(IntEnum):
+class ConnectionState(DBusIntEnum):
     """Connection states.
 
     https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMActiveConnectionState
@@ -280,7 +292,7 @@ class ConnectionStateFlags(IntEnum):
     EXTERNAL = 0x80
 
 
-class ConnectivityState(IntEnum):
+class ConnectivityState(DBusIntEnum):
     """Network connectvity.
 
     https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMConnectivityState
@@ -293,7 +305,7 @@ class ConnectivityState(IntEnum):
     CONNECTIVITY_FULL = 4
 
 
-class DeviceType(IntEnum):
+class DeviceType(DBusIntEnum):
     """Device types.
 
     https://networkmanager.dev/docs/api/latest/nm-dbus-types.html#NMDeviceType
@@ -302,13 +314,41 @@ class DeviceType(IntEnum):
     UNKNOWN = 0
     ETHERNET = 1
     WIRELESS = 2
+    UNUSED1 = 3
+    UNUSED2 = 4
     BLUETOOTH = 5
+    OLPC_MESH = 6
+    WIMAX = 7
+    MODEM = 8
+    INFINIBAND = 9
+    BOND = 10
     VLAN = 11
+    ADSL = 12
+    BRIDGE = 13
+    GENERIC = 14
+    TEAM = 15
     TUN = 16
+    IP_TUNNEL = 17
+    MAC_VLAN = 18
+    VXLAN = 19
     VETH = 20
+    MACSEC = 21
+    DUMMY = 22
+    PPP = 23
+    OVS_INTERFACE = 24
+    OVS_PORT = 25
+    OVS_BRIDGE = 26
+    WPAN = 27
+    LOWPAN6 = 28
+    WIREGUARD = 29
+    WIFI_P2P = 30
+    VRF = 31
+    LOOPBACK = 32
+    HSR = 33
+    IPVLAN = 34
 
 
-class WirelessMethodType(IntEnum):
+class WirelessMethodType(DBusIntEnum):
     """Device Type."""
 
     UNKNOWN = 0
@@ -325,7 +365,7 @@ class DNSAddressFamily(IntEnum):
     INET6 = AF_INET6
 
 
-class MulticastProtocolEnabled(StrEnum):
+class MulticastProtocolEnabled(DBusStrEnum):
     """Multicast protocol enabled or resolve."""
 
     YES = "yes"
@@ -333,7 +373,7 @@ class MulticastProtocolEnabled(StrEnum):
     RESOLVE = "resolve"
 
 
-class MulticastDnsValue(IntEnum):
+class MulticastDnsValue(DBusIntEnum):
     """Connection MulticastDNS (mdns/llmnr) values."""
 
     DEFAULT = -1
@@ -342,7 +382,7 @@ class MulticastDnsValue(IntEnum):
     ANNOUNCE = 2
 
 
-class DNSOverTLSEnabled(StrEnum):
+class DNSOverTLSEnabled(DBusStrEnum):
     """DNS over TLS enabled."""
 
     YES = "yes"
@@ -350,7 +390,7 @@ class DNSOverTLSEnabled(StrEnum):
     OPPORTUNISTIC = "opportunistic"
 
 
-class DNSSECValidation(StrEnum):
+class DNSSECValidation(DBusStrEnum):
     """DNSSEC validation enforced."""
 
     YES = "yes"
@@ -358,7 +398,7 @@ class DNSSECValidation(StrEnum):
     ALLOW_DOWNGRADE = "allow-downgrade"
 
 
-class DNSStubListenerEnabled(StrEnum):
+class DNSStubListenerEnabled(DBusStrEnum):
     """DNS stub listener enabled."""
 
     YES = "yes"
@@ -367,7 +407,7 @@ class DNSStubListenerEnabled(StrEnum):
     UDP_ONLY = "udp"
 
 
-class ResolvConfMode(StrEnum):
+class ResolvConfMode(DBusStrEnum):
     """Resolv.conf management mode."""
 
     FOREIGN = "foreign"
@@ -396,7 +436,18 @@ class StartUnitMode(StrEnum):
     ISOLATE = "isolate"
 
 
-class UnitActiveState(StrEnum):
+class SystemState(DBusStrEnum):
+    """State of the systemd manager."""
+
+    INITIALIZING = "initializing"
+    STARTING = "starting"
+    RUNNING = "running"
+    DEGRADED = "degraded"
+    MAINTENANCE = "maintenance"
+    STOPPING = "stopping"
+
+
+class UnitActiveState(DBusStrEnum):
     """Active state of a systemd unit."""
 
     ACTIVE = "active"

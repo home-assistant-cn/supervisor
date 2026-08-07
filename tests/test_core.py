@@ -1,6 +1,8 @@
 """Testing handling with CoreState."""
 
 # pylint: disable=W0212
+import asyncio
+from contextlib import suppress
 import datetime
 import errno
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -9,11 +11,16 @@ import pytest
 
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
-from supervisor.exceptions import WhoamiSSLError
+from supervisor.exceptions import AppFileReadError, HassioError, WhoamiSSLError
 from supervisor.host.control import SystemControl
 from supervisor.host.info import InfoCenter
+from supervisor.resolution.const import IssueType, SuggestionType, UnhealthyReason
 from supervisor.supervisor import Supervisor
 from supervisor.utils.whoami import WhoamiData
+
+from tests.dbus_service_mocks.base import DBusServiceMock
+from tests.dbus_service_mocks.systemd import Systemd as SystemdService
+from tests.dbus_service_mocks.systemd_unit import SystemdUnit as SystemdUnitService
 
 
 @pytest.mark.parametrize("run_supervisor_state", ["test_file"], indirect=True)
@@ -70,11 +77,18 @@ async def test_adjust_system_datetime_without_ssl(
 
 
 async def test_adjust_system_datetime_if_time_behind(
-    coresys: CoreSys, websession: MagicMock
+    coresys: CoreSys,
+    websession: MagicMock,
+    all_dbus_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ):
-    """Test _adjust_system_datetime method when current time is ahead more than 3 days."""
+    """Test _adjust_system_datetime method when current time is ahead more than 1 hour."""
+    systemd_service: SystemdService = all_dbus_services["systemd"]
+    systemd_service.StopUnit.calls.clear()
+    systemd_unit_service: SystemdUnitService = all_dbus_services["systemd_unit"]
+    systemd_unit_service.active_state = "active"
+
     utc_ts = datetime.datetime.now().replace(tzinfo=datetime.UTC) + datetime.timedelta(
-        days=4
+        hours=1, minutes=1
     )
     with (
         patch(
@@ -87,13 +101,37 @@ async def test_adjust_system_datetime_if_time_behind(
         patch.object(
             InfoCenter, "dt_synchronized", new=PropertyMock(return_value=False)
         ),
-        patch.object(Supervisor, "check_connectivity") as mock_check_connectivity,
+        patch.object(InfoCenter, "use_ntp", new=PropertyMock(return_value=True)),
+        patch.object(
+            Supervisor, "check_and_update_connectivity"
+        ) as mock_check_connectivity,
     ):
-        await coresys.core._adjust_system_datetime()
+        # Start the time adjustment which will wait for timesyncd to stop
+        task = asyncio.create_task(coresys.core._adjust_system_datetime())
+        await asyncio.sleep(0.1)
+        # Simulate timesyncd stopping via D-Bus signal
+        systemd_unit_service.emit_properties_changed({"ActiveState": "inactive"})
+        await task
+
         mock_retrieve_whoami.assert_called_once()
         mock_set_datetime.assert_called_once()
         mock_check_connectivity.assert_called_once()
         mock_set_timezone.assert_called_once_with("Europe/Zurich")
+
+        # Verify timesyncd was stopped before setting time
+        assert systemd_service.StopUnit.calls == [
+            ("systemd-timesyncd.service", "replace")
+        ]
+
+        # Verify issue was created
+        assert any(
+            issue.type == IssueType.NTP_SYNC_FAILED
+            for issue in coresys.resolution.issues
+        )
+        assert any(
+            suggestion.type == SuggestionType.ENABLE_NTP
+            for suggestion in coresys.resolution.suggestions
+        )
 
 
 async def test_adjust_system_datetime_sync_timezone_to_host(
@@ -121,3 +159,257 @@ async def test_write_state_failure(
 
     assert "Can't update the Supervisor state" in caplog.text
     assert coresys.core.state == CoreState.RUNNING
+
+
+# Components whose load() method is awaited from Core.setup().
+_SETUP_LOAD_COMPONENTS = (
+    "api",
+    "hardware",
+    "dbus",
+    "host",
+    "os",
+    "mounts",
+    "docker",
+    "updater",
+    "plugins",
+    "homeassistant",
+    "arch",
+    "store",
+    "apps",
+    "backups",
+    "services",
+    "discovery",
+    "ingress",
+    "resolution",
+)
+
+
+@pytest.fixture
+def mocked_setup_loads(coresys: CoreSys):
+    """Replace all load() calls in Core.setup() with AsyncMock."""
+    with (
+        patch.object(coresys, "init_websession", new=AsyncMock()),
+        patch.object(Supervisor, "check_and_update_connectivity", new=AsyncMock()),
+        patch.object(coresys.core, "_adjust_system_datetime", new=AsyncMock()),
+    ):
+        patches = [
+            patch.object(getattr(coresys, attr), "load", new=AsyncMock())
+            for attr in _SETUP_LOAD_COMPONENTS
+        ]
+        for p in patches:
+            p.start()
+        try:
+            yield
+        finally:
+            for p in patches:
+                p.stop()
+
+
+@pytest.mark.usefixtures("mocked_setup_loads")
+async def test_setup_app_file_read_error_not_captured(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test setup does not capture AppFileReadError to Sentry but marks unhealthy."""
+    coresys.apps.load.side_effect = AppFileReadError(
+        app="local_example", error="[Errno 74] Bad message"
+    )
+    with patch("supervisor.core.async_capture_exception") as capture_mock:
+        await coresys.core.setup()
+
+    capture_mock.assert_not_called()
+    assert "Fatal error happening on load Task" not in caplog.text
+    assert "Error on load Task" in caplog.text
+    assert UnhealthyReason.SETUP in coresys.resolution.unhealthy
+
+
+@pytest.mark.usefixtures("mocked_setup_loads")
+async def test_setup_unhandled_exception_captured(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test setup captures unhandled exceptions to Sentry and marks unhealthy."""
+    coresys.apps.load.side_effect = HassioError("boom")
+    with patch("supervisor.core.async_capture_exception") as capture_mock:
+        await coresys.core.setup()
+
+    capture_mock.assert_called_once()
+    assert "Fatal error happening on load Task" in caplog.text
+    assert UnhealthyReason.SETUP in coresys.resolution.unhealthy
+
+
+async def test_shutdown_reentrant_waits(coresys: CoreSys):
+    """Concurrent shutdown() calls await the in-flight shutdown rather than re-running."""
+    call_count = 0
+    shutdown_started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    original_shutdown = coresys.apps.shutdown
+
+    async def slow_app_shutdown(startup):
+        nonlocal call_count
+        call_count += 1
+        shutdown_started.set()
+        await proceed.wait()
+        return await original_shutdown(startup)
+
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    with patch.object(coresys.apps, "shutdown", side_effect=slow_app_shutdown):
+        task1 = asyncio.create_task(coresys.core.shutdown())
+        await shutdown_started.wait()
+
+        # Second call should wait, not start a new shutdown
+        task2 = asyncio.create_task(coresys.core.shutdown())
+        await asyncio.sleep(0.05)
+
+        proceed.set()
+        await asyncio.gather(task1, task2)
+
+    # AppStartup has 4 levels (APPLICATION/SERVICES/SYSTEM/INITIALIZE); a single
+    # shutdown call iterates them. A re-entered shutdown would double the count.
+    assert call_count == 4
+    assert coresys.core._shutdown_event.is_set()
+
+
+async def test_shutdown_releases_event_when_set_state_cancelled(coresys: CoreSys):
+    """Cancellation mid set_state() must still release waiters.
+
+    set_state() updates Core._state before awaiting the run-state file write.
+    If cancellation hits during that await, in-memory state is already
+    SHUTDOWN. Without the try/finally around set_state(), _shutdown_event
+    would never be set and concurrent callers would deadlock on wait().
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    cancel_during_write = asyncio.Event()
+
+    async def cancel_during_set_state(*_args, **_kwargs):
+        cancel_during_write.set()
+        await asyncio.sleep(3600)  # wait long enough to be cancelled
+
+    with patch.object(
+        coresys.core, "_write_run_state", side_effect=cancel_during_set_state
+    ):
+        task = asyncio.create_task(coresys.core.shutdown())
+        await cancel_during_write.wait()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    # In-memory state moved to SHUTDOWN before the cancellation point
+    assert coresys.core.state == CoreState.SHUTDOWN
+    # finally must have run so any future caller does not deadlock
+    assert coresys.core._shutdown_event.is_set()
+
+
+async def test_shutdown_transitions_state(coresys: CoreSys):
+    """Shutdown moves Core into SHUTDOWN state so HA Core/WS observers react."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    await coresys.core.shutdown()
+    assert coresys.core.state == CoreState.SHUTDOWN
+
+
+async def test_teardown_services_does_not_change_state(coresys: CoreSys):
+    """Teardown leaves Core state alone so callers (e.g. backup restore) control it."""
+    await coresys.core.set_state(CoreState.FREEZE)
+    await coresys.core.teardown_services()
+    assert coresys.core.state == CoreState.FREEZE
+
+
+async def test_teardown_services_does_not_stop_plugins(coresys: CoreSys):
+    """Plugins must keep running across teardown so restore can talk to them."""
+    await coresys.core.set_state(CoreState.FREEZE)
+    with patch.object(coresys.plugins, "shutdown") as mock_plugins_shutdown:
+        await coresys.core.teardown_services()
+    mock_plugins_shutdown.assert_not_called()
+
+
+async def test_shutdown_stops_plugins(coresys: CoreSys):
+    """Real shutdown stops plugins as the final step."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    with patch.object(coresys.plugins, "shutdown") as mock_plugins_shutdown:
+        await coresys.core.shutdown()
+    mock_plugins_shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "state", [CoreState.STOPPING, CoreState.CLOSE], ids=["stopping", "close"]
+)
+async def test_shutdown_ignored_during_stop(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture, state: CoreState
+):
+    """Shutdown is ignored when Supervisor is already stopping."""
+    await coresys.core.set_state(state)
+
+    with patch.object(coresys.apps, "shutdown") as mock_app_shutdown:
+        await coresys.core.shutdown()
+
+    mock_app_shutdown.assert_not_called()
+    assert "Ignoring shutdown request, Supervisor is already stopping" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "state",
+    [CoreState.INITIALIZE, CoreState.STARTUP, CoreState.SETUP],
+    ids=["initialize", "startup", "setup"],
+)
+async def test_shutdown_skipped_during_startup(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture, state: CoreState
+):
+    """Shutdown returns early when Supervisor has not finished starting yet."""
+    await coresys.core.set_state(state)
+
+    with patch.object(coresys.apps, "shutdown") as mock_app_shutdown:
+        await coresys.core.shutdown()
+
+    mock_app_shutdown.assert_not_called()
+    assert (
+        "Ignoring shutdown request, Supervisor has not finished starting" in caplog.text
+    )
+
+
+async def test_stop_signals_stopping_complete(coresys: CoreSys):
+    """Test stop() sets stopping_complete before starting the teardown."""
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    stopping = asyncio.Event()
+    seen_at_api_stop: list[tuple[CoreState, bool]] = []
+
+    async def api_stop():
+        seen_at_api_stop.append((coresys.core.state, stopping.is_set()))
+
+    coresys._websession = AsyncMock()
+    with (
+        patch.object(coresys.api, "stop", new=api_stop),
+        patch.object(coresys.scheduler, "shutdown", new=AsyncMock()),
+        patch.object(coresys.docker, "unload", new=AsyncMock()),
+        patch.object(coresys.homeassistant.api, "close", new=AsyncMock()),
+        patch.object(coresys.ingress, "unload", new=AsyncMock()),
+        patch.object(coresys.hardware, "unload", new=AsyncMock()),
+        patch.object(coresys.dbus, "unload", new=AsyncMock()),
+        patch.object(coresys.loop, "stop") as loop_stop,
+    ):
+        await coresys.core.stop(stopping_complete=stopping)
+
+    assert stopping.is_set()
+    assert coresys.core.state == CoreState.CLOSE
+    # The event was set while STOPPING, before the API teardown began
+    assert seen_at_api_stop == [(CoreState.STOPPING, True)]
+    loop_stop.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "state", [CoreState.STOPPING, CoreState.CLOSE], ids=["stopping", "close"]
+)
+async def test_stop_reentry_signals_event_without_teardown(
+    coresys: CoreSys, state: CoreState
+):
+    """Test stop() while already stopping sets the event and does nothing else."""
+    await coresys.core.set_state(state)
+
+    stopping = asyncio.Event()
+    with patch.object(coresys.api, "stop", new=(api_stop := AsyncMock())):
+        await coresys.core.stop(stopping_complete=stopping)
+
+    assert stopping.is_set()
+    api_stop.assert_not_called()
+    assert coresys.core.state == state

@@ -7,34 +7,63 @@ import logging
 
 import aiohttp
 from aiohttp import WSCloseCode, WSMessageTypeError, web
-from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.client_ws import ClientWebSocketResponse
 from aiohttp.hdrs import AUTHORIZATION, CONTENT_TYPE
 from aiohttp.http_websocket import WSMsgType
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPUnauthorized
 
-from supervisor.utils.logging import AddonLoggerAdapter
-
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError, HomeAssistantAPIError, HomeAssistantAuthError
 from ..utils.json import json_dumps
+from ..utils.logging import AppLoggerAdapter
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
-FORWARD_HEADERS = ("X-Speech-Content",)
+FORWARD_HEADERS = (
+    "X-Speech-Content",
+    "Accept",
+    "Last-Event-ID",
+    "Mcp-Session-Id",
+    "MCP-Protocol-Version",
+)
 HEADER_HA_ACCESS = "X-Ha-Access"
-
-# Maximum message size for websocket messages from Home Assistant.
-# Since these are coming from core we want the largest possible size
-# that is not likely to cause a memory problem as most modern browsers
-# support large messages.
-# https://github.com/home-assistant/supervisor/issues/4392
-MAX_MESSAGE_SIZE_FROM_CORE = 64 * 1024 * 1024
 
 
 class APIProxy(CoreSysAttributes):
     """API Proxy for Home Assistant."""
+
+    async def _stream_client_response(
+        self,
+        request: web.Request,
+        client: aiohttp.ClientResponse,
+        *,
+        content_type: str,
+        headers_to_copy: tuple[str, ...] = (),
+    ) -> web.StreamResponse:
+        """Stream an upstream aiohttp response to the caller.
+
+        Used for event streams (e.g. Home Assistant /api/stream) and for SSE endpoints
+        such as MCP (text/event-stream).
+        """
+        response = web.StreamResponse(status=client.status)
+        response.content_type = content_type
+
+        for header in headers_to_copy:
+            if header in client.headers:
+                response.headers[header] = client.headers[header]
+
+        response.headers["X-Accel-Buffering"] = "no"
+
+        try:
+            await response.prepare(request)
+            async for data in client.content:
+                await response.write(data)
+        except aiohttp.ClientError, aiohttp.ClientPayloadError:
+            # Client disconnected or upstream closed
+            pass
+
+        return response
 
     def _check_access(self, request: web.Request):
         """Check the Supervisor token."""
@@ -44,16 +73,16 @@ class APIProxy(CoreSysAttributes):
         else:
             supervisor_token = request.headers.get(HEADER_HA_ACCESS, "")
 
-        addon = self.sys_addons.from_token(supervisor_token)
-        if not addon:
+        app = self.sys_apps.from_token(supervisor_token)
+        if not app:
             _LOGGER.warning("Unknown Home Assistant API access!")
-        elif not addon.access_homeassistant_api:
-            _LOGGER.warning("Not permitted API access: %s", addon.slug)
+        elif not app.access_homeassistant_api:
+            _LOGGER.warning("Not permitted API access: %s", app.slug)
         else:
-            _LOGGER.debug("%s access from %s", request.path, addon.slug)
+            _LOGGER.debug("%s access from %s", request.path, app.slug)
             return
 
-        raise HTTPUnauthorized()
+        raise HTTPUnauthorized
 
     @asynccontextmanager
     async def _api_client(
@@ -69,7 +98,7 @@ class APIProxy(CoreSysAttributes):
                     for name, value in request.headers.items()
                     if name in FORWARD_HEADERS
                 },
-                content_type=request.content_type,
+                content_type=request.headers.get(CONTENT_TYPE),
                 data=request.content,
                 timeout=timeout,
                 params=request.query,
@@ -86,26 +115,21 @@ class APIProxy(CoreSysAttributes):
         except TimeoutError:
             _LOGGER.error("Client timeout error on API request %s", path)
 
-        raise HTTPBadGateway()
+        raise HTTPBadGateway
 
     async def stream(self, request: web.Request):
         """Proxy HomeAssistant EventStream Requests."""
         self._check_access(request)
         if not await self.sys_homeassistant.api.check_api_state():
-            raise HTTPBadGateway()
+            raise HTTPBadGateway
 
         _LOGGER.info("Home Assistant EventStream start")
         async with self._api_client(request, "stream", timeout=None) as client:
-            response = web.StreamResponse()
-            response.content_type = request.headers.get(CONTENT_TYPE, "")
-            try:
-                response.headers["X-Accel-Buffering"] = "no"
-                await response.prepare(request)
-                async for data in client.content:
-                    await response.write(data)
-
-            except (aiohttp.ClientError, aiohttp.ClientPayloadError):
-                pass
+            response = await self._stream_client_response(
+                request,
+                client,
+                content_type=request.headers.get(CONTENT_TYPE, ""),
+            )
 
             _LOGGER.info("Home Assistant EventStream close")
             return response
@@ -114,75 +138,53 @@ class APIProxy(CoreSysAttributes):
         """Proxy Home Assistant API Requests."""
         self._check_access(request)
         if not await self.sys_homeassistant.api.check_api_state():
-            raise HTTPBadGateway()
+            raise HTTPBadGateway
 
         # Normal request
         path = request.match_info.get("path", "")
         async with self._api_client(request, path) as client:
+            # Check if this is a streaming response (e.g., MCP SSE endpoints)
+            if client.content_type == "text/event-stream":
+                return await self._stream_client_response(
+                    request,
+                    client,
+                    content_type=client.content_type,
+                    headers_to_copy=(
+                        "Cache-Control",
+                        "Mcp-Session-Id",
+                    ),
+                )
+
+            # Non-streaming response
             data = await client.read()
-            return web.Response(
+            response = web.Response(
                 body=data, status=client.status, content_type=client.content_type
             )
+            # Copy selected headers from the upstream response
+            for header in (
+                "Cache-Control",
+                "Mcp-Session-Id",
+            ):
+                if header in client.headers:
+                    response.headers[header] = client.headers[header]
+            return response
 
     async def _websocket_client(self) -> ClientWebSocketResponse:
         """Initialize a WebSocket API connection."""
-        url = f"{self.sys_homeassistant.api_url}/api/websocket"
-
         try:
-            client = await self.sys_websession.ws_connect(
-                url, heartbeat=30, ssl=False, max_msg_size=MAX_MESSAGE_SIZE_FROM_CORE
-            )
-
-            # Handle authentication
-            data = await client.receive_json()
-
-            if data.get("type") == "auth_ok":
-                return client
-
-            if data.get("type") != "auth_required":
-                # Invalid protocol
-                raise APIError(
-                    f"Got unexpected response from Home Assistant WebSocket: {data}",
-                    _LOGGER.error,
-                )
-
-            # Auth session
-            await self.sys_homeassistant.api.ensure_access_token()
-            await client.send_json(
-                {
-                    "type": "auth",
-                    "access_token": self.sys_homeassistant.api.access_token,
-                },
-                dumps=json_dumps,
-            )
-
-            data = await client.receive_json()
-
-            if data.get("type") == "auth_ok":
-                return client
-
-            # Renew the Token is invalid
-            if (
-                data.get("type") == "invalid_auth"
-                and self.sys_homeassistant.refresh_token
-            ):
-                self.sys_homeassistant.api.access_token = None
-                return await self._websocket_client()
-
-            raise HomeAssistantAuthError()
-
-        except (RuntimeError, ValueError, TypeError, ClientConnectorError) as err:
-            _LOGGER.error("Client error on WebSocket API %s.", err)
-        except HomeAssistantAuthError:
-            _LOGGER.error("Failed authentication to Home Assistant WebSocket")
-
-        raise APIError()
+            ws_client = await self.sys_homeassistant.api.connect_websocket()
+            return ws_client.client
+        except HomeAssistantAPIError as err:
+            raise APIError(
+                f"Error connecting to Home Assistant WebSocket: {err}",
+                _LOGGER.error,
+            ) from err
 
     async def _proxy_message(
         self,
         source: web.WebSocketResponse | ClientWebSocketResponse,
         target: web.WebSocketResponse | ClientWebSocketResponse,
-        logger: AddonLoggerAdapter,
+        logger: AppLoggerAdapter,
     ) -> None:
         """Proxy a message from client to server or vice versa."""
         while not source.closed and not target.closed:
@@ -196,7 +198,7 @@ class APIProxy(CoreSysAttributes):
                     logger.debug(
                         "Received WebSocket message type %r from %s.",
                         msg.type,
-                        "add-on" if type(source) is web.WebSocketResponse else "Core",
+                        "app" if type(source) is web.WebSocketResponse else "Core",
                     )
                     await target.close()
                 case WSMsgType.CLOSING:
@@ -219,13 +221,18 @@ class APIProxy(CoreSysAttributes):
     async def websocket(self, request: web.Request):
         """Initialize a WebSocket API connection."""
         if not await self.sys_homeassistant.api.check_api_state():
-            raise HTTPBadGateway()
+            raise HTTPBadGateway
         _LOGGER.info("Home Assistant WebSocket API request initialize")
+
+        # Check if transport is still valid before WebSocket upgrade
+        if request.transport is None:
+            _LOGGER.warning("WebSocket connection lost before upgrade")
+            raise web.HTTPBadRequest(reason="Connection closed")
 
         # init server
         server = web.WebSocketResponse(heartbeat=30)
         await server.prepare(request)
-        addon_name = None
+        app_name = None
 
         # handle authentication
         try:
@@ -239,9 +246,9 @@ class APIProxy(CoreSysAttributes):
             supervisor_token = response.get("api_password") or response.get(
                 "access_token"
             )
-            addon = self.sys_addons.from_token(supervisor_token)
+            app = self.sys_apps.from_token(supervisor_token)
 
-            if not addon or not addon.access_homeassistant_api:
+            if not app or not app.access_homeassistant_api:
                 _LOGGER.warning("Unauthorized WebSocket access!")
                 await server.send_json(
                     {"type": "auth_invalid", "message": "Invalid access"},
@@ -249,8 +256,8 @@ class APIProxy(CoreSysAttributes):
                 )
                 return server
 
-            addon_name = addon.slug
-            _LOGGER.info("WebSocket access from %s", addon_name)
+            app_name = app.slug
+            _LOGGER.info("WebSocket access from %s", app_name)
 
             await server.send_json(
                 {"type": "auth_ok", "ha_version": self.sys_homeassistant.version},
@@ -274,7 +281,7 @@ class APIProxy(CoreSysAttributes):
         except APIError:
             return server
 
-        logger = AddonLoggerAdapter(_LOGGER, {"addon_name": addon_name})
+        logger = AppLoggerAdapter(_LOGGER, {"app_name": app_name})
         logger.info("Home Assistant WebSocket API proxy running")
 
         client_task = self.sys_create_task(self._proxy_message(client, server, logger))

@@ -1,43 +1,47 @@
 """Test Docker interface."""
 
 import asyncio
-from pathlib import Path
+from http import HTTPStatus
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, call, patch
 
 import aiodocker
+from aiodocker.containers import DockerContainer
 from awesomeversion import AwesomeVersion
-from docker.errors import DockerException, NotFound
-from docker.models.containers import Container
 import pytest
-from requests import RequestException
 
-from supervisor.addons.manager import Addon
+from supervisor.apps.manager import App
 from supervisor.const import BusEvent, CoreState, CpuArch
 from supervisor.coresys import CoreSys
 from supervisor.docker.const import ContainerState
-from supervisor.docker.interface import DockerInterface
+from supervisor.docker.interface import DOCKER_HUB, DOCKER_HUB_LEGACY, DockerInterface
 from supervisor.docker.manager import PullLogEntry, PullProgressDetail
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
     DockerAPIError,
     DockerError,
+    DockerHubRateLimitExceeded,
     DockerNoSpaceOnDevice,
     DockerNotFound,
-    DockerRequestError,
+    DockerRegistryAuthError,
+    DockerRegistryRateLimitExceeded,
+    DockerTimeoutError,
+    GithubContainerRegistryRateLimitExceeded,
 )
-from supervisor.jobs import JobSchedulerOptions, SupervisorJob
+from supervisor.homeassistant.const import WSEvent, WSType
+from supervisor.jobs import ChildJobSyncFilter, JobSchedulerOptions, SupervisorJob
+from supervisor.jobs.decorator import Job
+from supervisor.resolution.const import ContextType, IssueType
+from supervisor.resolution.data import Issue
+from supervisor.supervisor import Supervisor
 
 from tests.common import AsyncIterator, load_json_fixture
 
 
 @pytest.mark.parametrize(
-    "cpu_arch, platform",
+    ("cpu_arch", "platform"),
     [
-        (CpuArch.ARMV7, "linux/arm/v7"),
-        (CpuArch.ARMHF, "linux/arm/v6"),
         (CpuArch.AARCH64, "linux/arm64"),
-        (CpuArch.I386, "linux/386"),
         (CpuArch.AMD64, "linux/amd64"),
     ],
 )
@@ -51,7 +55,7 @@ async def test_docker_image_platform(
     coresys.docker.images.inspect.return_value = {"Id": "test:1.2.3"}
     await test_docker_interface.install(AwesomeVersion("1.2.3"), "test", arch=cpu_arch)
     coresys.docker.images.pull.assert_called_once_with(
-        "test", tag="1.2.3", platform=platform, stream=True
+        "test", tag="1.2.3", platform=platform, auth=None, stream=True
     )
     coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
@@ -63,19 +67,126 @@ async def test_docker_image_default_platform(
     coresys.docker.images.inspect.return_value = {"Id": "test:1.2.3"}
     with (
         patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
         ),
     ):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
         coresys.docker.images.pull.assert_called_once_with(
-            "test", tag="1.2.3", platform="linux/386", stream=True
+            "test", tag="1.2.3", platform="linux/amd64", auth=None, stream=True
         )
 
     coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
 
 @pytest.mark.parametrize(
-    "attrs,expected",
+    ("image", "registry_key"),
+    [
+        ("homeassistant/amd64-supervisor", DOCKER_HUB),
+        ("ghcr.io/home-assistant/amd64-supervisor", "ghcr.io"),
+    ],
+)
+async def test_private_registry_credentials_passed_to_pull(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    image: str,
+    registry_key: str,
+):
+    """Test credentials for private registries are passed to aiodocker pull."""
+    coresys.docker.images.inspect.return_value = {"Id": f"{image}:1.2.3"}
+
+    # Configure registry credentials
+    coresys.docker.config._data["registries"] = {  # pylint: disable=protected-access
+        registry_key: {"username": "testuser", "password": "testpass"}
+    }
+
+    with patch.object(
+        type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+    # Verify credentials were passed to aiodocker
+    expected_auth = {
+        "username": "testuser",
+        "password": "testpass",
+        "registry": registry_key,
+    }
+
+    # For Docker Hub, image should be prefixed with docker.io/ so aiodocker
+    # sets the correct ServerAddress in X-Registry-Auth
+    expected_image = (
+        f"{DOCKER_HUB}/{image}"
+        if registry_key in (DOCKER_HUB, DOCKER_HUB_LEGACY)
+        else image
+    )
+
+    coresys.docker.images.pull.assert_called_once_with(
+        expected_image,
+        tag="1.2.3",
+        platform="linux/amd64",
+        auth=expected_auth,
+        stream=True,
+    )
+
+
+async def test_pull_401_with_credentials_raises_auth_error(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+):
+    """Test that a 401 during pull with credentials raises DockerRegistryAuthError."""
+    image = "homeassistant/amd64-supervisor"
+
+    # Configure registry credentials
+    coresys.docker.config._data["registries"] = {  # pylint: disable=protected-access
+        "docker.io": {"username": "baduser", "password": "badpass"}
+    }
+
+    # Make pull raise 401
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.UNAUTHORIZED,
+        {"message": "unauthorized: incorrect username or password"},
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(DockerRegistryAuthError, match="docker.io"),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+
+async def test_pull_401_without_credentials_raises_docker_error(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+):
+    """Test that a 401 during pull without credentials raises generic DockerError."""
+    image = "homeassistant/amd64-supervisor"
+
+    # No registry credentials configured
+
+    # Make pull raise 401
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.UNAUTHORIZED,
+        {"message": "unauthorized: incorrect username or password"},
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(DockerError, match="Can't install"),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+
+@pytest.mark.parametrize(
+    ("attrs", "expected"),
     [
         ({"State": {"Status": "running"}}, ContainerState.RUNNING),
         ({"State": {"Status": "exited", "ExitCode": 0}}, ContainerState.STOPPED),
@@ -91,78 +202,83 @@ async def test_docker_image_default_platform(
     ],
 )
 async def test_current_state(
-    coresys: CoreSys, attrs: dict[str, Any], expected: ContainerState
+    coresys: CoreSys,
+    container: DockerContainer,
+    attrs: dict[str, Any],
+    expected: ContainerState,
 ):
     """Test current state for container."""
-    container_collection = MagicMock()
-    container_collection.get.return_value = Container(attrs)
-    with patch(
-        "supervisor.docker.manager.DockerAPI.containers",
-        new=PropertyMock(return_value=container_collection),
-    ):
-        assert await coresys.homeassistant.core.instance.current_state() == expected
+    container.show.return_value = attrs
+    assert await coresys.homeassistant.core.instance.current_state() == expected
 
 
 async def test_current_state_failures(coresys: CoreSys):
     """Test failure states for current state."""
-    container_collection = MagicMock()
-    with patch(
-        "supervisor.docker.manager.DockerAPI.containers",
-        new=PropertyMock(return_value=container_collection),
-    ):
-        container_collection.get.side_effect = NotFound("dne")
-        assert (
-            await coresys.homeassistant.core.instance.current_state()
-            == ContainerState.UNKNOWN
-        )
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        404, {"message": "does not exist"}
+    )
+    assert (
+        await coresys.homeassistant.core.instance.current_state()
+        == ContainerState.UNKNOWN
+    )
 
-        container_collection.get.side_effect = DockerException()
-        with pytest.raises(DockerAPIError):
-            await coresys.homeassistant.core.instance.current_state()
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        500, {"message": "fail"}
+    )
+    with pytest.raises(DockerAPIError):
+        await coresys.homeassistant.core.instance.current_state()
 
-        container_collection.get.side_effect = RequestException()
-        with pytest.raises(DockerRequestError):
-            await coresys.homeassistant.core.instance.current_state()
+
+async def test_current_state_timeout(coresys: CoreSys):
+    """Test timeout while reading container state raises DockerTimeoutError."""
+    coresys.docker.containers.get.side_effect = TimeoutError("timed out")
+
+    with pytest.raises(DockerTimeoutError, match="Timeout occurred"):
+        await coresys.homeassistant.core.instance.current_state()
 
 
 @pytest.mark.parametrize(
-    "attrs,expected,fired_when_skip_down",
+    ("attrs", "expected", "expected_exit_code", "fired_when_skip_down"),
     [
-        ({"State": {"Status": "running"}}, ContainerState.RUNNING, True),
-        ({"State": {"Status": "exited", "ExitCode": 0}}, ContainerState.STOPPED, False),
+        ({"State": {"Status": "running"}}, ContainerState.RUNNING, None, True),
+        (
+            {"State": {"Status": "exited", "ExitCode": 0}},
+            ContainerState.STOPPED,
+            None,
+            False,
+        ),
         (
             {"State": {"Status": "exited", "ExitCode": 137}},
             ContainerState.FAILED,
+            137,
             False,
         ),
         (
             {"State": {"Status": "running", "Health": {"Status": "healthy"}}},
             ContainerState.HEALTHY,
+            None,
             True,
         ),
         (
             {"State": {"Status": "running", "Health": {"Status": "unhealthy"}}},
             ContainerState.UNHEALTHY,
+            None,
             True,
         ),
     ],
 )
 async def test_attach_existing_container(
     coresys: CoreSys,
+    container: DockerContainer,
     attrs: dict[str, Any],
     expected: ContainerState,
+    expected_exit_code: int | None,
     fired_when_skip_down: bool,
 ):
     """Test attaching to existing container."""
-    attrs["Id"] = "abc123"
-    attrs["Config"] = {}
-    container_collection = MagicMock()
-    container_collection.get.return_value = Container(attrs)
+    container.id = "abc123"
+    container.show.return_value = {"Id": "abc123", "Config": {}} | attrs
     with (
-        patch(
-            "supervisor.docker.manager.DockerAPI.containers",
-            new=PropertyMock(return_value=container_collection),
-        ),
         patch.object(type(coresys.bus), "fire_event") as fire_event,
         patch("supervisor.docker.interface.time", return_value=1),
     ):
@@ -175,7 +291,9 @@ async def test_attach_existing_container(
         ] == [
             call(
                 BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
-                DockerContainerStateEvent("homeassistant", expected, "abc123", 1),
+                DockerContainerStateEvent(
+                    "homeassistant", expected, "abc123", 1, expected_exit_code
+                ),
             )
         ]
 
@@ -202,7 +320,9 @@ async def test_attach_existing_container(
 
 async def test_attach_container_failure(coresys: CoreSys):
     """Test attach fails to find container but finds image."""
-    coresys.docker.containers.get.side_effect = DockerException()
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        500, {"message": "fail"}
+    )
     coresys.docker.images.inspect.return_value.setdefault("Config", {})["Image"] = (
         "sha256:abc123"
     )
@@ -220,7 +340,9 @@ async def test_attach_container_failure(coresys: CoreSys):
 
 async def test_attach_total_failure(coresys: CoreSys):
     """Test attach fails to find container or image."""
-    coresys.docker.containers.get.side_effect = DockerException
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        500, {"message": "fail"}
+    )
     coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
         400, {"message": ""}
     )
@@ -228,14 +350,11 @@ async def test_attach_total_failure(coresys: CoreSys):
         await coresys.homeassistant.core.instance.attach(AwesomeVersion("2022.7.3"))
 
 
-@pytest.mark.parametrize(
-    "err", [aiodocker.DockerError(400, {"message": ""}), RequestException()]
-)
-async def test_image_pull_fail(
-    coresys: CoreSys, capture_exception: Mock, err: Exception
-):
+async def test_image_pull_fail(coresys: CoreSys, capture_exception: Mock):
     """Test failure to pull image."""
-    coresys.docker.images.inspect.side_effect = err
+    coresys.docker.images.inspect.side_effect = err = aiodocker.DockerError(
+        400, {"message": ""}
+    )
     with pytest.raises(DockerError):
         await coresys.homeassistant.core.instance.install(
             AwesomeVersion("2022.7.3"), arch=CpuArch.AMD64
@@ -244,21 +363,19 @@ async def test_image_pull_fail(
     capture_exception.assert_called_once_with(err)
 
 
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
 async def test_run_missing_image(
-    coresys: CoreSys,
-    install_addon_ssh: Addon,
-    container: MagicMock,
-    capture_exception: Mock,
-    path_extern,
-    tmp_supervisor_data: Path,
+    coresys: CoreSys, install_app_ssh: App, capture_exception: Mock
 ):
     """Test run captures the exception when image is missing."""
-    coresys.docker.containers.create.side_effect = [NotFound("missing"), MagicMock()]
-    container.status = "stopped"
-    install_addon_ssh.data["image"] = "test_image"
+    coresys.docker.containers.create.side_effect = [
+        aiodocker.DockerError(HTTPStatus.NOT_FOUND, {"message": "missing"}),
+        MagicMock(),
+    ]
+    install_app_ssh.data["image"] = "test_image"
 
     with pytest.raises(DockerNotFound):
-        await install_addon_ssh.instance.run()
+        await install_app_ssh.instance.run()
 
     capture_exception.assert_called_once()
 
@@ -276,7 +393,7 @@ async def test_install_fires_progress_events(
         },
         {"status": "Already exists", "progressDetail": {}, "id": "6e771e15690e"},
         {"status": "Pulling fs layer", "progressDetail": {}, "id": "1578b14a573c"},
-        {"status": "Waiting", "progressDetail": {}, "id": "2488d0e401e1"},
+        {"status": "Waiting", "progressDetail": {}, "id": "1578b14a573c"},
         {
             "status": "Downloading",
             "progressDetail": {"current": 1378, "total": 1486},
@@ -314,16 +431,16 @@ async def test_install_fires_progress_events(
 
     with (
         patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
         ),
     ):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
         coresys.docker.images.pull.assert_called_once_with(
-            "test", tag="1.2.3", platform="linux/386", stream=True
+            "test", tag="1.2.3", platform="linux/amd64", auth=None, stream=True
         )
         coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(0)
     assert events == [
         PullLogEntry(
             job_id=ANY,
@@ -346,7 +463,7 @@ async def test_install_fires_progress_events(
             job_id=ANY,
             status="Waiting",
             progress_detail=PullProgressDetail(),
-            id="2488d0e401e1",
+            id="1578b14a573c",
         ),
         PullLogEntry(
             job_id=ANY,
@@ -391,11 +508,9 @@ async def test_install_fires_progress_events(
     ]
 
 
+@pytest.mark.usefixtures("ha_ws_client")
 async def test_install_progress_rounding_does_not_cause_misses(
-    coresys: CoreSys,
-    test_docker_interface: DockerInterface,
-    ha_ws_client: AsyncMock,
-    capture_exception: Mock,
+    coresys: CoreSys, test_docker_interface: DockerInterface, capture_exception: Mock
 ):
     """Test extremely close progress events do not create rounding issues."""
     coresys.core.set_state(CoreState.RUNNING)
@@ -500,6 +615,7 @@ async def test_install_raises_on_pull_error(
             "status": "Pulling from home-assistant/odroid-n2-homeassistant",
             "id": "2025.7.2",
         },
+        {"status": "Pulling fs layer", "progressDetail": {}, "id": "1578b14a573c"},
         {
             "status": "Downloading",
             "progressDetail": {"current": 1378, "total": 1486},
@@ -514,11 +630,9 @@ async def test_install_raises_on_pull_error(
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
 
 
+@pytest.mark.usefixtures("ha_ws_client")
 async def test_install_progress_handles_download_restart(
-    coresys: CoreSys,
-    test_docker_interface: DockerInterface,
-    ha_ws_client: AsyncMock,
-    capture_exception: Mock,
+    coresys: CoreSys, test_docker_interface: DockerInterface, capture_exception: Mock
 ):
     """Test install handles docker progress events that include a download restart."""
     coresys.core.set_state(CoreState.RUNNING)
@@ -530,7 +644,7 @@ async def test_install_progress_handles_download_restart(
 
     with (
         patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
         ),
     ):
         # Schedule job so we can listen for the end. Then we can assert against the WS mock
@@ -554,16 +668,39 @@ async def test_install_progress_handles_download_restart(
     capture_exception.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "extract_log",
+    [
+        {
+            "status": "Extracting",
+            "progressDetail": {"current": 96, "total": 96},
+            "progress": "[==================================================>]      96B/96B",
+            "id": "02a6e69d8d00",
+        },
+        {
+            "status": "Extracting",
+            "progressDetail": {"current": 1, "units": "s"},
+            "progress": "1 s",
+            "id": "02a6e69d8d00",
+        },
+    ],
+    ids=["normal_extract_log", "containerd_snapshot_extract_log"],
+)
 async def test_install_progress_handles_layers_skipping_download(
     coresys: CoreSys,
     test_docker_interface: DockerInterface,
     capture_exception: Mock,
+    extract_log: dict[str, Any],
 ):
     """Test install handles small layers that skip downloading phase and go directly to download complete.
 
     Reproduces the real-world scenario from Supervisor issue #6286:
     - Small layer (02a6e69d8d00) completes Download complete at 10:14:08 without ever Downloading
     - Normal layer (3f4a84073184) starts Downloading at 10:14:09 with progress updates
+
+    Under containerd snapshotter this presumably can still occur and Supervisor will have even less info
+    since extract logs don't have a total. Supervisor should generally just ignore these and set progress
+    from the larger images that take all the time.
     """
     coresys.core.set_state(CoreState.RUNNING)
 
@@ -607,12 +744,7 @@ async def test_install_progress_handles_layers_skipping_download(
         },
         {"status": "Pull complete", "progressDetail": {}, "id": "3f4a84073184"},
         # Small layer finally extracts (10:14:58 in logs)
-        {
-            "status": "Extracting",
-            "progressDetail": {"current": 96, "total": 96},
-            "progress": "[==================================================>]      96B/96B",
-            "id": "02a6e69d8d00",
-        },
+        extract_log,
         {"status": "Pull complete", "progressDetail": {}, "id": "02a6e69d8d00"},
         {"status": "Digest: sha256:test"},
         {"status": "Status: Downloaded newer image for test/image:latest"},
@@ -649,11 +781,18 @@ async def test_install_progress_handles_layers_skipping_download(
         await install_task
         await event.wait()
 
-        # First update from layer download should have rather low progress ((260937/25445459) / 2 ~ 0.5%)
-        assert install_job_snapshots[0]["progress"] < 1
+        # With the new progress calculation approach:
+        # - Progress is weighted by layer size
+        # - Small layers that skip downloading get minimal size (1 byte)
+        # - Progress should increase monotonically
+        assert len(install_job_snapshots) > 0
 
-        # Total 8 events should lead to a progress update on the install job
-        assert len(install_job_snapshots) == 8
+        # Verify progress is monotonically increasing (or stable)
+        for i in range(1, len(install_job_snapshots)):
+            assert (
+                install_job_snapshots[i]["progress"]
+                >= install_job_snapshots[i - 1]["progress"]
+            )
 
         # Job should complete successfully
         assert job.done is True
@@ -661,11 +800,9 @@ async def test_install_progress_handles_layers_skipping_download(
         capture_exception.assert_not_called()
 
 
+@pytest.mark.usefixtures("ha_ws_client")
 async def test_missing_total_handled_gracefully(
-    coresys: CoreSys,
-    test_docker_interface: DockerInterface,
-    ha_ws_client: AsyncMock,
-    capture_exception: Mock,
+    coresys: CoreSys, test_docker_interface: DockerInterface, capture_exception: Mock
 ):
     """Test missing 'total' fields in progress details handled gracefully."""
     coresys.core.set_state(CoreState.RUNNING)
@@ -720,3 +857,304 @@ async def test_missing_total_handled_gracefully(
     await event.wait()
 
     capture_exception.assert_not_called()
+
+
+async def test_install_progress_containerd_snapshot(
+    coresys: CoreSys, ha_ws_client: AsyncMock
+):
+    """Test install handles docker progress events using containerd snapshotter."""
+    coresys.core.set_state(CoreState.RUNNING)
+
+    class FakeDockerInterface(DockerInterface):
+        """Fake interface for events."""
+
+        @property
+        def name(self) -> str:
+            """Name of test interface."""
+            return "test_interface"
+
+        @Job(
+            name="mock_docker_interface_install",
+            child_job_syncs=[
+                ChildJobSyncFilter("docker_interface_install", progress_allocation=1.0)
+            ],
+        )
+        async def mock_install(self) -> None:
+            """Mock install."""
+            await super().install(
+                AwesomeVersion("1.2.3"), image="test", arch=CpuArch.AMD64
+            )
+
+    # Fixture emulates log as received when using containerd snapshotter
+    # Should not error but progress gets choppier once extraction starts
+    logs = load_json_fixture("docker_pull_image_log_containerd_snapshot.json")
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
+    test_docker_interface = FakeDockerInterface(coresys)
+
+    with patch.object(Supervisor, "arch", PropertyMock(return_value="amd64")):
+        await test_docker_interface.mock_install()
+        coresys.docker.images.pull.assert_called_once_with(
+            "test", tag="1.2.3", platform="linux/amd64", auth=None, stream=True
+        )
+        coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
+
+    await asyncio.sleep(0)
+
+    def job_event(progress: float, done: bool = False):
+        return {
+            "type": WSType.SUPERVISOR_EVENT,
+            "data": {
+                "event": WSEvent.JOB,
+                "data": {
+                    "name": "mock_docker_interface_install",
+                    "reference": "test_interface",
+                    "uuid": ANY,
+                    "progress": progress,
+                    "stage": None,
+                    "done": done,
+                    "parent_id": None,
+                    "errors": [],
+                    "created": ANY,
+                    "extra": None,
+                },
+            },
+        }
+
+    assert [c.args[0] for c in ha_ws_client.async_send_command.call_args_list] == [
+        # Count-based progress: 2 layers, each = 50%. Download = 0-35%, Extract = 35-50%
+        job_event(0),
+        job_event(1.7),
+        job_event(3.4),
+        job_event(8.4),
+        job_event(10.2),
+        job_event(15.2),
+        job_event(18.7),
+        job_event(28.8),
+        job_event(35.7),
+        job_event(42.4),
+        job_event(49.3),
+        job_event(55.8),
+        job_event(62.7),
+        # Downloading phase is considered 70% of layer's progress.
+        # After download complete, extraction takes remaining 30% per layer.
+        job_event(70.0),
+        job_event(85.0),
+        job_event(100),
+        job_event(100, True),
+    ]
+
+
+# Registry-aware rate limit handling. Three independent error shapes can
+# occur on the same Docker pull endpoint:
+#   1. HTTP 429 (true rate limit, rare in practice)
+#   2. HTTP 500 with "toomanyrequests" in body (daemon bug pre-28.3.0;
+#      fixed upstream by moby/moby 23fa0ae74a, large fleet still on older)
+#   3. HTTP 200 with toomanyrequests in a pull-stream JSON event (happens
+#      on all recent daemons when the rate limit hits during layer fetch)
+# All three should converge to a registry-aware exception + resolution issue.
+
+# Parameters: (image, expected_exception, expect_docker_ratelimit_issue)
+# Only Docker Hub produces a resolution issue since logging in lifts the
+# unauthenticated quota. GHCR has no actionable remediation so we just log +
+# raise a typed exception; no issue is created.
+_RATE_LIMIT_PARAMS = [
+    (
+        "homeassistant/amd64-supervisor",
+        DockerHubRateLimitExceeded,
+        True,
+    ),
+    (
+        "ghcr.io/home-assistant/amd64-hassio-supervisor",
+        GithubContainerRegistryRateLimitExceeded,
+        False,
+    ),
+]
+
+
+def _assert_docker_ratelimit_issue(coresys: CoreSys, expected: bool) -> None:
+    """Assert whether the DOCKER_RATELIMIT resolution issue was created."""
+    present = Issue(IssueType.DOCKER_RATELIMIT, ContextType.SYSTEM) in (
+        coresys.resolution.issues
+    )
+    assert present is expected
+
+
+@pytest.mark.parametrize(
+    ("image", "expected_exception", "expect_issue"), _RATE_LIMIT_PARAMS
+)
+async def test_install_pull_429_raises_registry_specific_exception(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    capture_exception: Mock,
+    image: str,
+    expected_exception: type[Exception],
+    expect_issue: bool,
+):
+    """Test HTTP 429 from pull raises the right typed exception per registry.
+
+    Docker Hub also gets a DOCKER_RATELIMIT resolution issue (user can log
+    in to lift the quota). GHCR gets the typed exception only; no issue.
+    """
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.TOO_MANY_REQUESTS, {"message": "ratelimit"}
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(expected_exception),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+    _assert_docker_ratelimit_issue(coresys, expect_issue)
+    capture_exception.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("image", "expected_exception", "expect_issue"), _RATE_LIMIT_PARAMS
+)
+async def test_install_pull_500_with_toomanyrequests_body_treated_as_rate_limit(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    capture_exception: Mock,
+    image: str,
+    expected_exception: type[Exception],
+    expect_issue: bool,
+):
+    """Test that 500 with toomanyrequests in body is treated as a rate limit.
+
+    Docker daemons before 28.3.0 wrap upstream 429s as HTTP 500 to the
+    client (fixed upstream in moby/moby 23fa0ae74a). The large fleet on
+    older daemons still produces this shape, so we detect it from the
+    message body regardless of HTTP status.
+    """
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "toomanyrequests: retry-after: 777.482µs, allowed: 44000/minute",
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(expected_exception),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+    _assert_docker_ratelimit_issue(coresys, expect_issue)
+    capture_exception.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("image", "expected_exception", "expect_issue"), _RATE_LIMIT_PARAMS
+)
+async def test_install_streaming_pull_rate_limit(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    capture_exception: Mock,
+    image: str,
+    expected_exception: type[Exception],
+    expect_issue: bool,
+):
+    """Test toomanyrequests in pull stream is treated as a rate limit.
+
+    Docker's pull endpoint is a long-running streaming API - once the daemon
+    has started writing the response body it can no longer change the HTTP
+    status, so errors that occur during layer download are surfaced as JSON
+    error events in the stream. The text-detection in PullLogEntry must
+    convert these into a typed exception that install() can refine into a
+    registry-specific one. Happens on all recent daemon versions.
+    """
+    coresys.docker.images.pull.return_value = AsyncIterator(
+        [
+            {
+                "error": (
+                    "toomanyrequests: retry-after: 1.265943ms, allowed: 44000/minute"
+                )
+            },
+        ]
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(expected_exception),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+    _assert_docker_ratelimit_issue(coresys, expect_issue)
+    capture_exception.assert_not_called()
+
+
+async def test_install_unknown_registry_rate_limit_raises_generic_exception(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    capture_exception: Mock,
+):
+    """Test rate limit on unknown registry raises generic exception, no issue.
+
+    For registries we don't have specific guidance for (not Docker Hub, not
+    GHCR), we still raise a typed rate limit exception (so retry logic works),
+    but skip the resolution issue since we have no actionable suggestion.
+    """
+    image = "myregistry.example.com/some/image"
+
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.TOO_MANY_REQUESTS, {"message": "ratelimit"}
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(DockerRegistryRateLimitExceeded) as exc_info,
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+    # Generic base class only - not refined to either subclass
+    assert not isinstance(exc_info.value, DockerHubRateLimitExceeded)
+    assert not isinstance(exc_info.value, GithubContainerRegistryRateLimitExceeded)
+    _assert_docker_ratelimit_issue(coresys, False)
+    capture_exception.assert_not_called()
+
+
+async def test_attach_container_get_timeout_falls_through_to_image(coresys: CoreSys):
+    """Test attach suppresses TimeoutError from containers.get and falls through to image inspect."""
+    coresys.docker.containers.get.side_effect = TimeoutError()
+    coresys.docker.images.inspect.return_value.setdefault("Config", {})["Image"] = (
+        "sha256:abc123"
+    )
+    # Should not raise - timeout is suppressed, falls back to image inspect
+    await coresys.homeassistant.core.instance.attach(AwesomeVersion("2022.7.3"))
+    coresys.docker.images.inspect.assert_called()
+
+
+async def test_attach_fallback_image_inspect_timeout(coresys: CoreSys):
+    """Test attach raises DockerTimeoutError when fallback image inspect times out."""
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        500, {"message": "fail"}
+    )
+    coresys.docker.images.inspect.side_effect = TimeoutError()
+    with pytest.raises(
+        DockerTimeoutError, match="Timeout occurred while inspecting image"
+    ):
+        await coresys.homeassistant.core.instance.attach(AwesomeVersion("2022.7.3"))
+
+
+async def test_exists_timeout_suppressed(
+    coresys: CoreSys, test_docker_interface: DockerInterface
+):
+    """Test exists returns False and suppresses TimeoutError from images.inspect."""
+    coresys.docker.images.inspect.side_effect = TimeoutError()
+    result = await test_docker_interface.exists()
+    assert result is False

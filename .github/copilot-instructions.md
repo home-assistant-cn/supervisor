@@ -3,6 +3,11 @@
 This repository contains the Home Assistant Supervisor, a Python 3 based container
 orchestration and management system for Home Assistant.
 
+## Pull Request Requirements
+
+When opening a pull request in this repository, always use the description format
+from `.github/PULL_REQUEST_TEMPLATE.md`.
+
 ## Supervisor Capabilities & Features
 
 ### Architecture Overview
@@ -91,13 +96,15 @@ availability.
 
 ### Python Requirements
 
-- **Compatibility**: Python 3.13+
-- **Language Features**: Use modern Python features:
+  - **Compatibility**: Python 3.14+
+  - **Language Features**: Use modern Python features:
   - Type hints with `typing` module
   - f-strings (preferred over `%` or `.format()`)
   - Dataclasses and enum classes
   - Async/await patterns
   - Pattern matching where appropriate
+  - Parenthesis-free `except` clauses with comma-separated exceptions
+    (e.g., `except KeyError, TypeError:`) — available since Python 3.14
 
 ### Code Quality Standards
 
@@ -233,6 +240,8 @@ async def backup_full(self, request: web.Request) -> dict[str, Any]:
 - **Fixtures**: Extensive use of pytest fixtures for CoreSys setup
 - **Mocking**: Mock external dependencies (Docker, D-Bus, network calls)
 - **Coverage**: Minimum 90% test coverage, 100% for security-sensitive code
+- **Style**: Use plain `test_` functions, not `Test*` classes — test classes are
+  considered legacy style in this project
 
 ### Error Handling
 
@@ -276,13 +285,23 @@ Always run the pre-commit hooks at the end of code editing.
 - Access Docker via `self.sys_docker` not direct Docker API
 - Use constants from `const.py` instead of hardcoding
 - Store types in (per-module) `const.py` (e.g. supervisor/store/const.py)
+- Use relative imports within the `supervisor/` package (e.g., `from ..docker.manager import ExecReturn`)
 
 **❌ Avoid These Patterns**:
 - Direct Docker API usage - use Supervisor's Docker manager
 - Blocking operations in async context (use asyncio alternatives)
 - Hardcoded values - use constants from `const.py`
 - Manual error handling in API endpoints - let `@api_process` handle it
+- Absolute imports within the `supervisor/` package (e.g., `from supervisor.docker.manager import ...`) - use relative imports instead
 
 This guide provides the foundation for contributing to Home Assistant Supervisor.
 Follow these patterns and guidelines to ensure code quality, security, and
 maintainability.
+
+## AI policy
+
+This project follows the [Open Home Foundation AI Policy](../AI_POLICY.md).
+Autonomous contributions are not accepted: a human must review, understand,
+and be able to explain every change before it is submitted. Do not open
+issues or pull requests autonomously, and do not post comments on behalf of
+a user without their review.

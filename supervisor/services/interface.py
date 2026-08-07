@@ -5,7 +5,7 @@ from typing import Any
 
 import voluptuous as vol
 
-from ..addons.addon import Addon
+from ..apps.app import App
 from ..const import PROVIDE_SERVICE
 from ..coresys import CoreSys, CoreSysAttributes
 
@@ -34,17 +34,17 @@ class ServiceInterface(CoreSysAttributes, ABC):
 
     @property
     def providers(self) -> list[str]:
-        """Return name of service providers addon."""
-        addons = []
-        for addon in self.sys_addons.installed:
-            if addon.services_role.get(self.slug) == PROVIDE_SERVICE:
-                addons.append(addon.slug)
-        return addons
+        """Return name of service providers app."""
+        apps = []
+        for app in self.sys_apps.installed:
+            if app.services_role.get(self.slug) == PROVIDE_SERVICE:
+                apps.append(app.slug)
+        return apps
 
     @property
     @abstractmethod
     def active(self) -> list[str]:
-        """Return list of addon slug they have enable that."""
+        """Return list of app slug they have enable that."""
 
     @property
     def enabled(self) -> bool:
@@ -62,9 +62,9 @@ class ServiceInterface(CoreSysAttributes, ABC):
         return None
 
     @abstractmethod
-    async def set_service_data(self, addon: Addon, data: dict[str, Any]) -> None:
+    async def set_service_data(self, app: App, data: dict[str, Any]) -> None:
         """Write the data into service object."""
 
     @abstractmethod
-    async def del_service_data(self, addon: Addon) -> None:
+    async def del_service_data(self, app: App) -> None:
         """Remove the data from service object."""

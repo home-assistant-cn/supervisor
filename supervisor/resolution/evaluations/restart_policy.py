@@ -1,10 +1,9 @@
 """Evaluation class for restart policy."""
 
-from supervisor.docker.const import RestartPolicy
-from supervisor.docker.interface import DockerInterface
-
 from ...const import CoreState
 from ...coresys import CoreSys
+from ...docker.const import RestartPolicy
+from ...docker.interface import DockerInterface
 from ..const import UnsupportedReason
 from .base import EvaluateBase
 
@@ -49,7 +48,7 @@ class EvaluateRestartPolicy(EvaluateBase):
                 for plug in self.sys_plugins.all_plugins
                 if plug != self.sys_plugins.observer
             },
-            *{addon.instance for addon in self.sys_addons.installed},
+            *{app.instance for app in self.sys_apps.installed},
         }
 
     @property

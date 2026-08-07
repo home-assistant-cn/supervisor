@@ -12,6 +12,7 @@ ATTR_ERROR = "error"
 ATTR_OVERRIDE_IMAGE = "override_image"
 ATTR_SUCCESS = "success"
 LANDINGPAGE: AwesomeVersion = AwesomeVersion("landingpage")
+LANDINGPAGE_TYPE = "landingpage"
 WATCHDOG_RETRY_SECONDS = 10
 WATCHDOG_MAX_ATTEMPTS = 5
 WATCHDOG_THROTTLE_PERIOD = timedelta(minutes=30)
@@ -43,5 +44,6 @@ class WSEvent(StrEnum):
     ISSUE_CHANGED = "issue_changed"
     ISSUE_REMOVED = "issue_removed"
     JOB = "job"
+    STORE_RELOADED = "store_reloaded"
     SUPERVISOR_UPDATE = "supervisor_update"
     SUPPORTED_CHANGED = "supported_changed"

@@ -1,5 +1,6 @@
 """NetworkInterface object for Network Manager."""
 
+import logging
 from typing import Any
 
 from dbus_fast.aio.message_bus import MessageBus
@@ -22,6 +23,8 @@ from ..utils import dbus_connected
 from .connection import NetworkConnection
 from .setting import NetworkSetting
 from .wireless import NetworkWireless
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 class NetworkInterface(DBusInterfaceProxy):
@@ -57,7 +60,7 @@ class NetworkInterface(DBusInterfaceProxy):
     @dbus_property
     def type(self) -> DeviceType:
         """Return interface type."""
-        return self.properties[DBUS_ATTR_DEVICE_TYPE]
+        return DeviceType(self.properties[DBUS_ATTR_DEVICE_TYPE])
 
     @property
     @dbus_property
@@ -113,6 +116,16 @@ class NetworkInterface(DBusInterfaceProxy):
             self._wireless.shutdown()
 
         self._wireless = wireless
+
+    @dbus_connected
+    async def reapply(self) -> None:
+        """Reapply the active connection's settings to the device.
+
+        Applies changed settings without a full re-activation cycle. Raises
+        if NetworkManager cannot reapply the changes (e.g. a change to the
+        wireless security settings).
+        """
+        await self.connected_dbus.Device.call("reapply", {}, 0, 0)
 
     def __eq__(self, other: object) -> bool:
         """Is object equal to another."""

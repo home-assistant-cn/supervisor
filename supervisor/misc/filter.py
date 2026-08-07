@@ -1,19 +1,24 @@
 """Filter tools."""
 
+from dataclasses import asdict
 import ipaddress
+import logging
 import os
 import re
 from typing import cast
 
 from aiohttp import hdrs
-import attr
 from sentry_sdk.types import Event, Hint
 
 from ..const import DOCKER_IPV4_NETWORK_MASK, HEADER_TOKEN, HEADER_TOKEN_OLD, CoreState
 from ..coresys import CoreSys
-from ..exceptions import AddonConfigurationError
+from ..exceptions import APITooManyRequests, AppConfigurationError
+from ..utils import check_exception_chain
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 RE_URL: re.Pattern = re.compile(r"(\w+:\/\/)(.*\.\w+)(.*)")
+RE_URL_CREDENTIALS: re.Pattern = re.compile(r"(?<=://)[^/@\s]+@")
 
 
 def sanitize_host(host: str) -> str:
@@ -41,17 +46,48 @@ def sanitize_url(url: str) -> str:
     return f"{match.group(1)}{host}{match.group(3)}"
 
 
+def sanitize_url_credentials(text: str) -> str:
+    """Return text with userinfo credentials removed from any URLs."""
+    return RE_URL_CREDENTIALS.sub("", text)
+
+
 def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
     """Filter event data before sending to sentry."""
-    # Ignore some  exceptions
+    # Ignore some exceptions. check_exception_chain walks __cause__ so
+    # wrapped rate limits (e.g. DockerHubRateLimitExceeded wrapped in
+    # SupervisorUpdateError via `raise X from err`) are also dropped.
     if "exc_info" in hint:
         _, exc_value, _ = hint["exc_info"]
-        if isinstance(exc_value, (AddonConfigurationError)):
+        if exc_value is not None and check_exception_chain(
+            exc_value, (AppConfigurationError, APITooManyRequests)
+        ):
+            _LOGGER.debug("Skipping Sentry event for %s", type(exc_value).__name__)
             return None
 
     # Ignore issue if system is not supported or diagnostics is disabled
     if not coresys.config.diagnostics or not coresys.core.supported or coresys.dev:
         return None
+
+    # Repository URLs can contain user-supplied credentials for private
+    # repositories. Remove credentials from event strings which can contain
+    # such URLs: exception messages (including git stderr in GitPython
+    # exceptions), log messages and breadcrumbs.
+    for exc_entry in cast(dict, event.get("exception", {})).get("values", []):
+        if exc_entry.get("value"):
+            exc_entry["value"] = sanitize_url_credentials(exc_entry["value"])
+
+    if logentry := cast(dict, event.get("logentry", {})):
+        if logentry.get("message"):
+            logentry["message"] = sanitize_url_credentials(logentry["message"])
+        if params := logentry.get("params"):
+            logentry["params"] = [
+                sanitize_url_credentials(param) if isinstance(param, str) else param
+                for param in params
+            ]
+
+    for crumb in cast(dict, event.get("breadcrumbs", {})).get("values", []):
+        if crumb.get("message"):
+            crumb["message"] = sanitize_url_credentials(crumb["message"])
 
     event.setdefault("extra", {}).update({"os.environ": dict(os.environ)})
     event.setdefault("user", {}).update({"id": coresys.machine_id})
@@ -72,6 +108,9 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
                         "docker": coresys.docker.info.version,
                         "supervisor": coresys.supervisor.version,
                     },
+                    "docker": {
+                        "storage_driver": coresys.docker.info.storage,
+                    },
                     "host": {
                         "machine": coresys.machine,
                     },
@@ -79,10 +118,10 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
             )
         return event
 
-    # List installed addons
-    installed_addons = [
-        {"slug": addon.slug, "repository": addon.repository, "name": addon.name}
-        for addon in coresys.addons.installed
+    # List installed apps
+    installed_apps = [
+        {"slug": app.slug, "repository": app.repository, "name": app.name}
+        for app in coresys.apps.installed
     ]
 
     # Update information
@@ -90,10 +129,10 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
         {
             "supervisor": {
                 "channel": coresys.updater.channel,
-                "installed_addons": installed_addons,
+                "installed_addons": installed_apps,
             },
             "host": {
-                "arch": coresys.arch.default,
+                "arch": str(coresys.arch.default),
                 "board": coresys.os.board,
                 "deployment": coresys.host.info.deployment,
                 "disk_free_space": coresys.hardware.disk.get_disk_free_space(
@@ -111,16 +150,21 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
                 "docker": coresys.docker.info.version,
                 "supervisor": coresys.supervisor.version,
             },
+            "docker": {
+                "storage_driver": coresys.docker.info.storage,
+            },
             "resolution": {
-                "issues": [attr.asdict(issue) for issue in coresys.resolution.issues],
+                "issues": [asdict(issue) for issue in coresys.resolution.issues],
                 "suggestions": [
-                    attr.asdict(suggestion)
-                    for suggestion in coresys.resolution.suggestions
+                    asdict(suggestion) for suggestion in coresys.resolution.suggestions
                 ],
-                "unhealthy": coresys.resolution.unhealthy,
+                "unhealthy": sorted(coresys.resolution.unhealthy),
             },
             "store": {
-                "repositories": coresys.store.repository_urls,
+                "repositories": [
+                    sanitize_url_credentials(url)
+                    for url in coresys.store.repository_urls
+                ],
             },
             "misc": {
                 "fallback_dns": coresys.plugins.dns.fallback,

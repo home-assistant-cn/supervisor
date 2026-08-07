@@ -1,7 +1,9 @@
 """Interface to Systemd over D-Bus."""
 
+from collections.abc import Callable
 from functools import wraps
 import logging
+from typing import NamedTuple
 
 from dbus_fast import Variant
 from dbus_fast.aio.message_bus import MessageBus
@@ -15,6 +17,7 @@ from ..exceptions import (
 )
 from ..utils.dbus import DBusSignalWrapper
 from .const import (
+    DBUS_ATTR_ACTIVE_STATE,
     DBUS_ATTR_FINISH_TIMESTAMP,
     DBUS_ATTR_FIRMWARE_TIMESTAMP_MONOTONIC,
     DBUS_ATTR_KERNEL_TIMESTAMP_MONOTONIC,
@@ -23,17 +26,55 @@ from .const import (
     DBUS_ATTR_VIRTUALIZATION,
     DBUS_ERR_SYSTEMD_NO_SUCH_UNIT,
     DBUS_IFACE_SYSTEMD_MANAGER,
+    DBUS_IFACE_SYSTEMD_UNIT,
     DBUS_NAME_SYSTEMD,
     DBUS_OBJECT_SYSTEMD,
     DBUS_SIGNAL_PROPERTIES_CHANGED,
     StartUnitMode,
     StopUnitMode,
+    SystemState,
     UnitActiveState,
 )
 from .interface import DBusInterface, DBusInterfaceProxy, dbus_property
 from .utils import dbus_connected
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+class ExecStartEntry(NamedTuple):
+    """Systemd ExecStart entry for transient units (D-Bus type signature 'sasb')."""
+
+    binary: str
+    argv: list[str]
+    ignore_failure: bool
+
+
+def job_removed_filter(get_job_path: Callable[[], str | None]) -> Callable[..., bool]:
+    """Build a DBusSignalWrapper filter that matches a specific JobRemoved.
+
+    JobRemoved has signature `(u id, o job, s unit, s result)`. The filter
+    returns True only for the signal whose `job` path matches the one
+    returned by get_job_path() — used to wait for a specific systemd job
+    we dispatched, ignoring concurrent jobs on the system bus.
+
+    The getter indirection exists because race-free use requires
+    subscribing *before* dispatching the job (so we can't miss its
+    JobRemoved), which means the job path isn't known at filter
+    construction time. The closure reads it lazily at wait time:
+
+        job_path: str | None = None
+        async with systemd.connected_dbus.signal(
+            DBUS_SIGNAL_SYSTEMD_JOB_REMOVED,
+            job_removed_filter(lambda: job_path),
+        ) as signal:
+            job_path = await systemd.restart_unit(...)
+            _id, _path, _unit, result = await signal.wait_for_signal()
+    """
+
+    def _match(_id: int, path: str, _unit: str, _result: str) -> bool:
+        return path == get_job_path()
+
+    return _match
 
 
 def systemd_errors(func):
@@ -70,12 +111,31 @@ class SystemdUnit(DBusInterface):
     @dbus_connected
     async def get_active_state(self) -> UnitActiveState:
         """Get active state of the unit."""
-        return await self.connected_dbus.Unit.get("active_state")
+        return UnitActiveState(await self.connected_dbus.Unit.get("active_state"))
 
     @dbus_connected
     def properties_changed(self) -> DBusSignalWrapper:
         """Return signal wrapper for properties changed."""
         return self.connected_dbus.signal(DBUS_SIGNAL_PROPERTIES_CHANGED)
+
+    @dbus_connected
+    async def wait_for_active_state(
+        self, target_states: set[UnitActiveState]
+    ) -> UnitActiveState:
+        """Wait for unit to reach one of the target active states.
+
+        Caller must handle TimeoutError if a timeout is desired.
+        """
+        async with self.properties_changed() as signal:
+            state = await self.get_active_state()
+            while state not in target_states:
+                interface, changed, _ = await signal.wait_for_signal()
+                if (
+                    interface == DBUS_IFACE_SYSTEMD_UNIT
+                    and DBUS_ATTR_ACTIVE_STATE in changed
+                ):
+                    state = UnitActiveState(changed[DBUS_ATTR_ACTIVE_STATE].value)
+        return state
 
 
 class Systemd(DBusInterfaceProxy):
@@ -98,10 +158,16 @@ class Systemd(DBusInterfaceProxy):
             await super().connect(bus)
         except DBusError:
             _LOGGER.warning("Can't connect to systemd")
-        except (DBusServiceUnkownError, DBusInterfaceError):
+        except DBusServiceUnkownError, DBusInterfaceError:
             _LOGGER.warning(
                 "No systemd support on the host. Host control has been disabled."
             )
+
+        if self.is_connected:
+            try:
+                await self.connected_dbus.Manager.call("subscribe")
+            except DBusError:
+                _LOGGER.warning("Could not subscribe to systemd signals")
 
     @property
     @dbus_property
@@ -168,6 +234,18 @@ class Systemd(DBusInterfaceProxy):
     ) -> list[tuple[str, str, str, str, str, str, str, int, str, str]]:
         """Return a list of available systemd services."""
         return await self.connected_dbus.Manager.call("list_units")
+
+    @dbus_connected
+    async def list_units_filtered(
+        self, states: list[str]
+    ) -> list[tuple[str, str, str, str, str, str, str, int, str, str]]:
+        """Return a list of available systemd services filtered by state."""
+        return await self.connected_dbus.Manager.call("list_units_filtered", states)
+
+    @dbus_connected
+    async def get_system_state(self) -> SystemState:
+        """Return the systemd manager state."""
+        return SystemState(await self.connected_dbus.Manager.get("system_state"))
 
     @dbus_connected
     async def start_transient_unit(

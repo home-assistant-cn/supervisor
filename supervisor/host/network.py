@@ -5,7 +5,7 @@ from contextlib import suppress
 import logging
 from typing import Any
 
-from supervisor.utils.sentry import async_capture_exception
+from dbus_fast import Variant
 
 from ..const import ATTR_HOST_INTERNET
 from ..coresys import CoreSys, CoreSysAttributes
@@ -16,12 +16,17 @@ from ..dbus.const import (
     DBUS_IFACE_DNS,
     DBUS_IFACE_NM,
     DBUS_SIGNAL_NM_CONNECTION_ACTIVE_CHANGED,
-    ConnectionStateType,
+    ConnectionState,
     ConnectivityState,
     DeviceType,
     WirelessMethodType,
 )
 from ..dbus.network.connection import NetworkConnection
+from ..dbus.network.interface import NetworkInterface
+from ..dbus.network.setting import (
+    CONF_ATTR_802_WIRELESS_SECURITY,
+    CONF_ATTR_802_WIRELESS_SECURITY_PSK,
+)
 from ..dbus.network.setting.generate import get_connection_from_interface
 from ..exceptions import (
     DBusError,
@@ -34,6 +39,7 @@ from ..exceptions import (
 from ..jobs.const import JobCondition
 from ..jobs.decorator import Job
 from ..resolution.checks.network_interface_ipv4 import CheckNetworkInterfaceIPV4
+from ..utils.sentry import async_capture_exception
 from .configuration import AccessPoint, Interface
 from .const import InterfaceMethod, WifiMode
 
@@ -70,8 +76,11 @@ class NetworkManager(CoreSysAttributes):
         self.sys_homeassistant.websocket.supervisor_update_event(
             "network", {ATTR_HOST_INTERNET: state}
         )
-        if state and not self.sys_supervisor.connectivity:
-            self.sys_create_task(self.sys_supervisor.check_connectivity())
+        if state:
+            # Host just regained connectivity; kick a fresh Supervisor probe.
+            # Coalescing in request_connectivity_check means redundant calls
+            # are safe, so no "only if supervisor is False" guard is needed.
+            self.sys_supervisor.request_connectivity_check(force=True)
 
     @property
     def interfaces(self) -> list[Interface]:
@@ -121,7 +130,7 @@ class NetworkManager(CoreSysAttributes):
     def get(self, inet_name: str) -> Interface:
         """Return interface from interface name."""
         if inet_name not in self.sys_dbus.network:
-            raise HostNetworkNotFound()
+            raise HostNetworkNotFound
 
         return Interface.from_dbus_interface(self.sys_dbus.network.get(inet_name))
 
@@ -238,6 +247,58 @@ class NetworkManager(CoreSysAttributes):
 
         await self.update(force_connectivity_check=True)
 
+    async def _apply_settings_in_place(
+        self,
+        inet: NetworkInterface,
+        interface: Interface,
+        settings: dict[str, dict[str, Variant]],
+        settings_changed: bool,
+        *,
+        update_only: bool,
+    ) -> bool:
+        """Try to make updated connection settings effective in place.
+
+        Return True if the settings are in effect without a full re-activation
+        cycle (unchanged or reapplied in place), False if the connection needs
+        to be activated.
+        """
+        # Secrets (Wi-Fi PSK) are excluded from GetSettings and ignored by
+        # NetworkManager's Reapply, so a change to them is neither detected
+        # nor applied in place. Always re-activate when the payload contains
+        # a PSK.
+        if CONF_ATTR_802_WIRELESS_SECURITY_PSK in settings.get(
+            CONF_ATTR_802_WIRELESS_SECURITY, {}
+        ):
+            return False
+
+        # In-place application requires an active connection
+        if not inet.connection or inet.connection.state != ConnectionState.ACTIVATED:
+            return False
+
+        if not settings_changed:
+            # User-initiated updates with unchanged settings still re-activate,
+            # both as a way to force a reconnect and to cover secret-only
+            # changes.
+            if not update_only:
+                return False
+            _LOGGER.debug(
+                "Settings for %s unchanged, skipping activation", interface.name
+            )
+            return True
+
+        try:
+            await inet.reapply()
+        except DBusError as err:
+            _LOGGER.debug(
+                "Can't reapply settings for %s in place: %s", interface.name, err
+            )
+            return False
+
+        _LOGGER.info(
+            "Reapplied changed settings for interface %s in place", interface.name
+        )
+        return True
+
     async def apply_changes(
         self, interface: Interface, *, update_only: bool = False
     ) -> None:
@@ -270,14 +331,24 @@ class NetworkManager(CoreSysAttributes):
             )
 
             try:
-                await inet.settings.update(settings)
-                con = activated = await self.sys_dbus.network.activate_connection(
-                    inet.settings.object_path, inet.object_path
-                )
-                _LOGGER.debug(
-                    "activate_connection returns %s",
-                    activated.object_path,
-                )
+                settings_changed = await inet.settings.update(settings)
+                if not await self._apply_settings_in_place(
+                    inet,
+                    interface,
+                    settings,
+                    settings_changed,
+                    update_only=update_only,
+                ):
+                    _LOGGER.info(
+                        "Activating connection for interface %s", interface.name
+                    )
+                    con = activated = await self.sys_dbus.network.activate_connection(
+                        inet.settings.object_path, inet.object_path
+                    )
+                    _LOGGER.debug(
+                        "activate_connection returns %s",
+                        activated.object_path,
+                    )
             except DBusError as err:
                 raise HostNetworkError(
                     f"Can't update config on {interface.name}: {err}", _LOGGER.error
@@ -292,7 +363,9 @@ class NetworkManager(CoreSysAttributes):
 
         # Create new configuration and activate interface
         elif interface.enabled:
-            _LOGGER.debug("Create new configuration for %s", interface.name)
+            _LOGGER.info(
+                "Creating and activating connection for interface %s", interface.name
+            )
             settings = get_connection_from_interface(interface, self.sys_dbus.network)
 
             try:
@@ -338,16 +411,16 @@ class NetworkManager(CoreSysAttributes):
                 # the state change before this point. Get the state currently to
                 # avoid any race condition.
                 await con.update()
-                state: ConnectionStateType = con.state
+                state: ConnectionState = con.state
 
-                while state != ConnectionStateType.ACTIVATED:
-                    if state == ConnectionStateType.DEACTIVATED:
+                while state != ConnectionState.ACTIVATED:
+                    if state == ConnectionState.DEACTIVATED:
                         raise HostNetworkError(
                             "Activating connection failed, check connection settings."
                         )
 
                     msg = await signal.wait_for_signal()
-                    state = msg[0]
+                    state = ConnectionState(msg[0])
                     _LOGGER.debug("Active connection state changed to %s", state)
 
         # update_only means not done by user so don't force a check afterwards
@@ -367,7 +440,7 @@ class NetworkManager(CoreSysAttributes):
             await inet.wireless.request_scan()
         except DBusError as err:
             _LOGGER.warning("Can't request a new scan: %s", err)
-            raise HostNetworkError() from err
+            raise HostNetworkError from err
 
         await asyncio.sleep(5)
 

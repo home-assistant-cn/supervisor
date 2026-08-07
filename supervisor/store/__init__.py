@@ -1,23 +1,25 @@
-"""Add-on Store handler."""
+"""App Store handler."""
 
 import asyncio
 from collections.abc import Awaitable
 import logging
 
-from ..const import ATTR_REPOSITORIES, REPOSITORY_CORE, URL_HASSIO_ADDONS
+from ..const import ATTR_REPOSITORIES, REPOSITORY_CORE, URL_HASSIO_APPS
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
     StoreError,
     StoreGitCloneError,
     StoreGitError,
-    StoreInvalidAddonRepo,
+    StoreInvalidAppRepo,
     StoreJobError,
     StoreNotFound,
+    StoreRepositoryAlreadyAddedError,
 )
+from ..homeassistant.const import WSEvent
 from ..jobs.decorator import Job, JobCondition
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..utils.common import FileConfiguration
-from .addon import AddonStore
+from .app import AppStore
 from .const import FILE_HASSIO_STORE, BuiltinRepository
 from .data import StoreData
 from .repository import Repository
@@ -27,7 +29,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 class StoreManager(CoreSysAttributes, FileConfiguration):
-    """Manage add-ons inside Supervisor."""
+    """Manage apps inside Supervisor."""
 
     def __init__(self, coresys: CoreSys):
         """Initialize Docker base wrapper."""
@@ -38,7 +40,7 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
 
     @property
     def all(self) -> list[Repository]:
-        """Return list of add-on repositories."""
+        """Return list of app repositories."""
         return list(self.repositories.values())
 
     @property
@@ -59,11 +61,11 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
     def get(self, slug: str) -> Repository:
         """Return Repository with slug."""
         if slug not in self.repositories:
-            raise StoreNotFound()
+            raise StoreNotFound
         return self.repositories[slug]
 
     async def load(self) -> None:
-        """Start up add-on store management."""
+        """Start up app store management."""
         # Make sure the built-in repositories are all present
         # This is especially important when adding new built-in repositories
         # to make sure existing installations have them.
@@ -82,7 +84,7 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         on_condition=StoreJobError,
     )
     async def reload(self, repository: Repository | None = None) -> None:
-        """Update add-ons from repository and reload list."""
+        """Update apps from repository and reload list."""
         # Make a copy to prevent race with other tasks
         repositories = [repository] if repository else self.all.copy()
         results: list[bool | BaseException] = await asyncio.gather(
@@ -101,19 +103,26 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
                     result,
                 )
 
-        # Update path cache for all addons in updated repos
+        # Update path cache for all apps in updated repos
         if updated_repos:
             await asyncio.gather(
                 *[
-                    addon.refresh_path_cache()
-                    for addon in self.sys_addons.store.values()
-                    if addon.repository in updated_repos
+                    app.refresh_path_cache()
+                    for app in self.sys_apps.store.values()
+                    if app.repository in updated_repos
                 ]
             )
 
             # read data from repositories
             await self.data.update()
-            await self._read_addons()
+            await self._read_apps()
+
+            # Notify Home Assistant so add-on update entities pick up the newly
+            # loaded store data instead of waiting for the next scheduled poll.
+            self.sys_homeassistant.websocket.supervisor_event(
+                WSEvent.STORE_RELOADED,
+                {ATTR_REPOSITORIES: sorted(updated_repos)},
+            )
 
     @Job(
         name="store_manager_add_repository",
@@ -133,13 +142,13 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         self, url: str, *, persist: bool = True, issue_on_error: bool = False
     ) -> None:
         """Add a repository."""
-        if url == URL_HASSIO_ADDONS:
+        if url == URL_HASSIO_APPS:
             url = REPOSITORY_CORE
 
         repository = Repository.create(self.coresys, url)
 
         if repository.slug in self.repositories:
-            raise StoreError(f"Can't add {url}, already in the store", _LOGGER.error)
+            raise StoreRepositoryAlreadyAddedError(_LOGGER.error, url=url)
 
         # Load the repository
         try:
@@ -186,17 +195,23 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         else:
             if not await repository.validate():
                 if issue_on_error:
-                    _LOGGER.error("%s is not a valid add-on repository", url)
+                    _LOGGER.error("%s is not a valid app repository", url)
                     self.sys_resolution.create_issue(
                         IssueType.CORRUPT_REPOSITORY,
                         ContextType.STORE,
                         reference=repository.slug,
-                        suggestions=[SuggestionType.EXECUTE_REMOVE],
+                        # A repository that validated before and now doesn't is
+                        # most likely a corrupt local copy. Offer a reset to
+                        # re-clone and self-heal, keeping removal as a fallback.
+                        suggestions=[
+                            SuggestionType.EXECUTE_RESET,
+                            SuggestionType.EXECUTE_REMOVE,
+                        ],
                     )
                 else:
                     await repository.remove()
-                    raise StoreInvalidAddonRepo(
-                        f"{url} is not a valid add-on repository", logger=_LOGGER.error
+                    raise StoreInvalidAppRepo(
+                        f"{url} is not a valid app repository", logger=_LOGGER.error
                     )
 
         # Add Repository to list
@@ -210,18 +225,18 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         # Persist changes
         if persist:
             await self.data.update()
-            await self._read_addons()
+            await self._read_apps()
 
     async def remove_repository(self, repository: Repository, *, persist: bool = True):
         """Remove a repository."""
         if repository.is_builtin:
-            raise StoreInvalidAddonRepo(
+            raise StoreInvalidAppRepo(
                 "Can't remove built-in repositories!", logger=_LOGGER.error
             )
 
-        if repository.slug in (addon.repository for addon in self.sys_addons.installed):
+        if repository.slug in (app.repository for app in self.sys_apps.installed):
             raise StoreError(
-                f"Can't remove '{repository.source}'. It's used by installed add-ons",
+                f"Can't remove '{repository.source}'. It's used by installed apps",
                 logger=_LOGGER.error,
             )
         await self.repositories.pop(repository.slug).remove()
@@ -230,7 +245,7 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
 
         if persist:
             await self.data.update()
-            await self._read_addons()
+            await self._read_apps()
 
     @Job(name="store_manager_update_repositories")
     async def update_repositories(
@@ -280,37 +295,37 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
 
         # Always update data, even if there are errors, some changes may have succeeded
         await self.data.update()
-        await self._read_addons()
+        await self._read_apps()
 
         # Raise the first error we found (if any)
         for error in add_errors + remove_errors:
             if error:
                 raise error
 
-    async def _read_addons(self) -> None:
-        """Reload add-ons inside store."""
-        all_addons = set(self.data.addons)
+    async def _read_apps(self) -> None:
+        """Reload apps inside store."""
+        all_apps = set(self.data.apps)
 
         # calc diff
-        add_addons = all_addons - set(self.sys_addons.store)
-        del_addons = set(self.sys_addons.store) - all_addons
+        add_apps = all_apps - set(self.sys_apps.store)
+        del_apps = set(self.sys_apps.store) - all_apps
 
         _LOGGER.info(
-            "Loading add-ons from store: %d all - %d new - %d remove",
-            len(all_addons),
-            len(add_addons),
-            len(del_addons),
+            "Loading apps from store: %d all - %d new - %d remove",
+            len(all_apps),
+            len(add_apps),
+            len(del_apps),
         )
 
-        # new addons
-        if add_addons:
+        # new apps
+        if add_apps:
             cache_updates: list[Awaitable[None]] = []
-            for slug in add_addons:
-                self.sys_addons.store[slug] = AddonStore(self.coresys, slug)
-                cache_updates.append(self.sys_addons.store[slug].refresh_path_cache())
+            for slug in add_apps:
+                self.sys_apps.store[slug] = AppStore(self.coresys, slug)
+                cache_updates.append(self.sys_apps.store[slug].refresh_path_cache())
 
             await asyncio.gather(*cache_updates)
 
         # remove
-        for slug in del_addons:
-            self.sys_addons.store.pop(slug)
+        for slug in del_apps:
+            self.sys_apps.store.pop(slug)

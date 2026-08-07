@@ -2,9 +2,10 @@
 
 from unittest.mock import MagicMock, patch
 
+from aiodocker.containers import DockerContainer
 import pytest
 
-from supervisor.addons.addon import Addon
+from supervisor.apps.app import App
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.docker.interface import DockerInterface
@@ -25,12 +26,17 @@ def _make_mock_container_get(bad_config_names: list[str], folder: str = "media")
         "Propagation": "rprivate",
     }
 
-    def mock_container_get(name):
-        out = MagicMock()
-        out.status = "running"
-        out.attrs = {"State": {}, "Mounts": []}
+    async def mock_container_get(name):
+        out = MagicMock(spec=DockerContainer)
+        out.show.return_value = {
+            "State": {
+                "Status": "running",
+                "Running": True,
+            },
+            "Mounts": [],
+        }
         if name in bad_config_names:
-            out.attrs["Mounts"].append(mount)
+            out.show.return_value["Mounts"].append(mount)
 
         return out
 
@@ -52,12 +58,17 @@ def _make_mock_container_get_with_volume_mount(
         "Propagation": "rprivate",  # Wrong propagation, but not our mount
     }
 
-    def mock_container_get(name):
-        out = MagicMock()
-        out.status = "running"
-        out.attrs = {"State": {}, "Mounts": []}
+    async def mock_container_get(name):
+        out = MagicMock(spec=DockerContainer)
+        out.show.return_value = {
+            "State": {
+                "Status": "running",
+                "Running": True,
+            },
+            "Mounts": [],
+        }
         if name in bad_config_names:
-            out.attrs["Mounts"].append(mount)
+            out.show.return_value["Mounts"].append(mount)
 
         return out
 
@@ -72,19 +83,18 @@ async def test_base(coresys: CoreSys):
 
 
 @pytest.mark.parametrize("folder", ["media", "share"])
-async def test_check(
-    docker: DockerAPI, coresys: CoreSys, install_addon_ssh: Addon, folder: str
-):
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_check(docker: DockerAPI, coresys: CoreSys, folder: str):
     """Test check reports issue when containers have incorrect config."""
     docker.containers.get = _make_mock_container_get(
-        ["homeassistant", "hassio_audio", "addon_local_ssh"], folder
+        ["homeassistant", "hassio_audio", "app_local_ssh"], folder
     )
     # Use state used in setup()
     await coresys.core.set_state(CoreState.SETUP)
     with patch.object(DockerInterface, "is_running", return_value=True):
         await coresys.plugins.load()
         await coresys.homeassistant.load()
-        await coresys.addons.load()
+        await coresys.apps.load()
 
     docker_config = CheckDockerConfig(coresys)
     assert not coresys.resolution.issues
@@ -129,16 +139,20 @@ async def test_check(
         in coresys.resolution.suggestions
     )
 
-    assert await docker_config.approve_check()
+    assert await docker_config.approve_check(
+        Issue(IssueType.DOCKER_CONFIG, ContextType.SYSTEM)
+    )
 
     # IF config issue is resolved, all issues are removed except the main one. Which will be removed if check isn't approved
     docker.containers.get = _make_mock_container_get([])
     with patch.object(DockerInterface, "is_running", return_value=True):
         await coresys.plugins.load()
         await coresys.homeassistant.load()
-        await coresys.addons.load()
+        await coresys.apps.load()
 
-    assert not await docker_config.approve_check()
+    assert not await docker_config.approve_check(
+        Issue(IssueType.DOCKER_CONFIG, ContextType.SYSTEM)
+    )
     assert len(coresys.resolution.issues) == 1
     assert len(coresys.resolution.suggestions) == 1
     assert (
@@ -147,43 +161,43 @@ async def test_check(
 
 
 @pytest.mark.parametrize("folder", ["media", "share"])
-async def test_addon_volume_mount_not_flagged(
-    docker: DockerAPI, coresys: CoreSys, install_addon_ssh: Addon, folder: str
+async def test_app_volume_mount_not_flagged(
+    docker: DockerAPI, coresys: CoreSys, install_app_ssh: App, folder: str
 ):
-    """Test that add-on with VOLUME mount to media/share but not in config is not flagged."""
-    # Create an add-on that doesn't have media/share in its mapping configuration
-    # Remove the mapping from the addon configuration
-    install_addon_ssh.data["map"] = [
+    """Test that app with VOLUME mount to media/share but not in config is not flagged."""
+    # Create an app that doesn't have media/share in its mapping configuration
+    # Remove the mapping from the app configuration
+    install_app_ssh.data["map"] = [
         {"type": "config", "read_only": False},
         {"type": "ssl", "read_only": True},
     ]  # No media/share
 
     # Mock container that has VOLUME mount to media/share with wrong propagation
     docker.containers.get = _make_mock_container_get_with_volume_mount(
-        ["addon_local_ssh"], folder
+        ["app_local_ssh"], folder
     )
 
     await coresys.core.set_state(CoreState.SETUP)
     with patch.object(DockerInterface, "is_running", return_value=True):
         await coresys.plugins.load()
         await coresys.homeassistant.load()
-        await coresys.addons.load()
+        await coresys.apps.load()
 
     docker_config = CheckDockerConfig(coresys)
     assert not coresys.resolution.issues
     assert not coresys.resolution.suggestions
 
-    # Run check - should NOT create issue for add-on since mount wasn't requested
+    # Run check - should NOT create issue for app since mount wasn't requested
     await docker_config.run_check()
 
-    # Should not create addon issue for VOLUME mounts not in config
-    addon_issues = [
+    # Should not create app issue for VOLUME mounts not in config
+    app_issues = [
         issue
         for issue in coresys.resolution.issues
         if issue.context == ContextType.ADDON and issue.reference == "local_ssh"
     ]
-    assert len(addon_issues) == 0, (
-        "Add-on should not be flagged for VOLUME mounts not in config"
+    assert len(app_issues) == 0, (
+        "App should not be flagged for VOLUME mounts not in config"
     )
 
     # No system issue should be created either if no containers have issues
@@ -196,12 +210,13 @@ async def test_addon_volume_mount_not_flagged(
 
 
 @pytest.mark.parametrize("folder", ["media", "share"])
-async def test_addon_configured_mount_still_flagged(
-    docker: DockerAPI, coresys: CoreSys, install_addon_ssh: Addon, folder: str
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_app_configured_mount_still_flagged(
+    docker: DockerAPI, coresys: CoreSys, folder: str
 ):
-    """Test that add-on with configured media/share mount is still flagged when propagation wrong."""
+    """Test that app with configured media/share mount is still flagged when propagation wrong."""
     # Keep the original configuration which includes media/share
-    # SSH addon config already has media:rw and share:rw
+    # SSH app config already has media:rw and share:rw
 
     # Mock container that has supervisor-managed mount with wrong propagation
     mount = {
@@ -213,12 +228,17 @@ async def test_addon_configured_mount_still_flagged(
         "Propagation": "rprivate",  # Wrong propagation
     }
 
-    def mock_container_get(name):
-        out = MagicMock()
-        out.status = "running"
-        out.attrs = {"State": {}, "Mounts": []}
-        if name == "addon_local_ssh":
-            out.attrs["Mounts"].append(mount)
+    async def mock_container_get(name):
+        out = MagicMock(spec=DockerContainer)
+        out.show.return_value = {
+            "State": {
+                "Status": "running",
+                "Running": True,
+            },
+            "Mounts": [],
+        }
+        if name == "app_local_ssh":
+            out.show.return_value["Mounts"].append(mount)
         return out
 
     docker.containers.get = mock_container_get
@@ -227,42 +247,47 @@ async def test_addon_configured_mount_still_flagged(
     with patch.object(DockerInterface, "is_running", return_value=True):
         await coresys.plugins.load()
         await coresys.homeassistant.load()
-        await coresys.addons.load()
+        await coresys.apps.load()
 
     docker_config = CheckDockerConfig(coresys)
     assert not coresys.resolution.issues
 
-    # Run check - should create issue for add-on since mount was requested in config
+    # Run check - should create issue for app since mount was requested in config
     await docker_config.run_check()
 
-    # Should have addon issue since the mount was configured
-    addon_issues = [
+    # Should have app issue since the mount was configured
+    app_issues = [
         issue
         for issue in coresys.resolution.issues
         if issue.context == ContextType.ADDON and issue.reference == "local_ssh"
     ]
-    assert len(addon_issues) == 1, (
-        "Add-on should be flagged for configured mounts with wrong propagation"
+    assert len(app_issues) == 1, (
+        "App should be flagged for configured mounts with wrong propagation"
     )
 
 
 @pytest.mark.parametrize("folder", ["media", "share"])
-async def test_addon_custom_target_path_flagged(
-    docker: DockerAPI, coresys: CoreSys, install_addon_ssh: Addon, folder: str
+async def test_app_custom_target_path_flagged(
+    docker: DockerAPI, coresys: CoreSys, install_app_ssh: App, folder: str
 ):
-    """Test that add-on with custom target path for media/share is properly checked."""
-    # Configure add-on with custom target path
+    """Test that app with custom target path for media/share is properly checked."""
+    # Configure app with custom target path
     custom_path = f"/custom/{folder}"
     mapping_type = "media" if folder == "media" else "share"
-    install_addon_ssh.data["map"] = [
+    install_app_ssh.data["map"] = [
         {"type": mapping_type, "read_only": False, "path": custom_path},
     ]
 
-    def mock_container_get(name: str) -> MagicMock:
+    async def mock_container_get(name: str) -> MagicMock:
         """Mock container get with custom target path mount."""
-        out = MagicMock()
-        out.status = "running"
-        out.attrs = {"State": {}, "Mounts": []}
+        out = MagicMock(spec=DockerContainer)
+        out.show.return_value = {
+            "State": {
+                "Status": "running",
+                "Running": True,
+            },
+            "Mounts": [],
+        }
 
         # Add mount with custom target path and wrong propagation
         mount = {
@@ -271,8 +296,8 @@ async def test_addon_custom_target_path_flagged(
             "Propagation": "rprivate",  # Wrong propagation
         }
 
-        if name == "addon_local_ssh":
-            out.attrs["Mounts"].append(mount)
+        if name == "app_local_ssh":
+            out.show.return_value["Mounts"].append(mount)
         return out
 
     docker.containers.get = mock_container_get
@@ -281,22 +306,22 @@ async def test_addon_custom_target_path_flagged(
     with patch.object(DockerInterface, "is_running", return_value=True):
         await coresys.plugins.load()
         await coresys.homeassistant.load()
-        await coresys.addons.load()
+        await coresys.apps.load()
 
     docker_config = CheckDockerConfig(coresys)
     assert not coresys.resolution.issues
 
-    # Run check - should create issue for add-on with custom target path
+    # Run check - should create issue for app with custom target path
     await docker_config.run_check()
 
-    # Should have addon issue since the mount with custom path was configured
-    addon_issues = [
+    # Should have app issue since the mount with custom path was configured
+    app_issues = [
         issue
         for issue in coresys.resolution.issues
         if issue.context == ContextType.ADDON and issue.reference == "local_ssh"
     ]
-    assert len(addon_issues) == 1, (
-        "Add-on should be flagged for configured mounts with custom paths and wrong propagation"
+    assert len(app_issues) == 1, (
+        "App should be flagged for configured mounts with custom paths and wrong propagation"
     )
 
 

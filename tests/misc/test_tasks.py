@@ -1,14 +1,15 @@
 """Test scheduled tasks."""
 
+import asyncio
 from collections.abc import AsyncGenerator
-from pathlib import Path
 from shutil import copy
-from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
+from aiodocker.containers import DockerContainer
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.addons.addon import Addon
+from supervisor.apps.app import App
 from supervisor.const import ATTR_VERSION_TIMESTAMP, CoreState
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import HomeAssistantError
@@ -16,6 +17,7 @@ from supervisor.homeassistant.api import HomeAssistantAPI
 from supervisor.homeassistant.const import LANDINGPAGE
 from supervisor.homeassistant.core import HomeAssistantCore
 from supervisor.misc.tasks import Tasks
+from supervisor.plugins.dns import PluginDns
 from supervisor.supervisor import Supervisor
 
 from tests.common import MockResponse, get_fixture_path
@@ -25,13 +27,14 @@ from tests.common import MockResponse, get_fixture_path
 
 @pytest.fixture(name="tasks")
 async def fixture_tasks(
-    coresys: CoreSys, container: MagicMock
+    coresys: CoreSys, container: DockerContainer
 ) -> AsyncGenerator[Tasks]:
     """Return task manager."""
     coresys.homeassistant.watchdog = True
     coresys.homeassistant.version = AwesomeVersion("2023.12.0")
-    container.status = "running"
-    yield Tasks(coresys)
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    return Tasks(coresys)
 
 
 async def test_watchdog_homeassistant_api(
@@ -102,10 +105,11 @@ async def test_watchdog_homeassistant_api_landing_page(tasks: Tasks, coresys: Co
 
 
 async def test_watchdog_homeassistant_api_not_running(
-    tasks: Tasks, container: MagicMock
+    tasks: Tasks, container: DockerContainer
 ):
     """Test watchdog of homeassistant api does not monitor when home assistant not running."""
-    container.status = "stopped"
+    container.show.return_value["State"]["Status"] = "stopped"
+    container.show.return_value["State"]["Running"] = False
 
     with (
         patch.object(HomeAssistantAPI, "check_api_state", return_value=False),
@@ -171,12 +175,9 @@ async def test_watchdog_homeassistant_api_reanimation_limit(
         rebuild.assert_not_called()
 
 
-@pytest.mark.usefixtures("no_job_throttle")
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
 async def test_reload_updater_triggers_supervisor_update(
-    tasks: Tasks,
-    coresys: CoreSys,
-    mock_update_data: MockResponse,
-    supervisor_internet: AsyncMock,
+    tasks: Tasks, coresys: CoreSys, mock_update_data: MockResponse
 ):
     """Test an updater reload triggers a supervisor update if there is one."""
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
@@ -190,7 +191,7 @@ async def test_reload_updater_triggers_supervisor_update(
         ),
         patch.object(Supervisor, "update") as update,
     ):
-        # Set supervisor's version intially
+        # Set supervisor's version initially
         await coresys.updater.reload()
         assert coresys.supervisor.latest_version == AwesomeVersion("2024.10.0")
 
@@ -205,10 +206,8 @@ async def test_reload_updater_triggers_supervisor_update(
         update.assert_called_once()
 
 
-@pytest.mark.usefixtures("path_extern")
-async def test_core_backup_cleanup(
-    tasks: Tasks, coresys: CoreSys, tmp_supervisor_data: Path
-):
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_core_backup_cleanup(tasks: Tasks, coresys: CoreSys):
     """Test core backup task cleans up old backup files."""
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
@@ -232,35 +231,103 @@ async def test_core_backup_cleanup(
     assert not old_tar.exists()
 
 
-async def test_update_addons_auto_update_success(
-    tasks: Tasks,
-    coresys: CoreSys,
-    tmp_supervisor_data: Path,
-    ha_ws_client: AsyncMock,
-    install_addon_example: Addon,
+@pytest.mark.usefixtures("no_job_throttle")
+async def test_update_dns_skipped_when_auto_update_disabled(
+    tasks: Tasks, coresys: CoreSys
 ):
-    """Test that an eligible add-on is auto-updated via websocket command."""
+    """Test plugin auto-update task is skipped when auto update is disabled."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.updater.auto_update = False
+
+    with patch.object(PluginDns, "update") as update:
+        await tasks._update_dns()
+        update.assert_not_called()
+
+
+@pytest.mark.usefixtures("no_job_throttle", "supervisor_internet")
+async def test_scheduled_reload_updater_triggers_one_supervisor_update(
+    tasks: Tasks, coresys: CoreSys, mock_update_data: MockResponse
+):
+    """Test scheduled reload updater triggers exactly one supervisor update.
+
+    Regression test: previously _update_supervisor ran on a separate schedule
+    in addition to being called from _reload_updater, causing duplicate updates.
+    Now only _reload_updater triggers the supervisor auto-update.
+    """
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
     await coresys.core.set_state(CoreState.RUNNING)
 
-    # Set up the add-on as eligible for auto-update
-    install_addon_example.auto_update = True
-    install_addon_example.data_store[ATTR_VERSION_TIMESTAMP] = 0
-    with patch.object(
-        Addon, "version", new=PropertyMock(return_value=AwesomeVersion("1.0"))
-    ):
-        assert install_addon_example.need_update is True
-        assert install_addon_example.auto_update_available is True
+    # Make version data show a newer supervisor version
+    version_data = await mock_update_data.text()
+    mock_update_data.update_text(version_data.replace("2024.10.0", "2024.10.1"))
 
-        # Make sure all job events from installing the add-on are cleared
+    with (
+        patch.object(
+            Supervisor,
+            "version",
+            new=PropertyMock(return_value=AwesomeVersion("2024.10.0")),
+        ),
+        patch.object(Supervisor, "update") as update,
+    ):
+        await tasks.load()
+        update.assert_not_called()
+
+        # Advance the event loop clock by 24h+ so scheduled tasks fire.
+        # Patching loop.time makes all call_later callbacks appear due;
+        # a tiny real sleep lets _run_once re-evaluate and execute them.
+        loop = asyncio.get_event_loop()
+        original_time = loop.time
+        loop.time = lambda: original_time() + 86401
+
+        try:
+            # Busy-wait until call_later callbacks fire and create jobs
+            while not any(t.job and not t.job.done() for t in coresys.scheduler._tasks):
+                await asyncio.sleep(0)
+
+            # Wait for all scheduler-created tasks to finish
+            pending = [
+                t.job for t in coresys.scheduler._tasks if t.job and not t.job.done()
+            ]
+            await asyncio.gather(*pending)
+
+            # Verify update was triggered exactly once
+            update.assert_called_once()
+        finally:
+            loop.time = original_time
+
+    await coresys.scheduler.shutdown()
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_update_apps_auto_update_success(
+    tasks: Tasks,
+    coresys: CoreSys,
+    ha_ws_client: AsyncMock,
+    install_app_example: App,
+):
+    """Test that an eligible app is auto-updated via websocket command."""
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    # Set up the app as eligible for auto-update
+    install_app_example.auto_update = True
+    install_app_example.data_store[ATTR_VERSION_TIMESTAMP] = 0
+    with patch.object(
+        App, "version", new=PropertyMock(return_value=AwesomeVersion("1.0"))
+    ):
+        assert install_app_example.need_update is True
+        assert install_app_example.auto_update_available is True
+
+        # Make sure all job events from installing the app are cleared
         ha_ws_client.async_send_command.reset_mock()
 
         # pylint: disable-next=protected-access
-        await tasks._update_addons()
+        await tasks._update_apps()
 
         ha_ws_client.async_send_command.assert_any_call(
             {
                 "type": "hassio/update/addon",
-                "addon": install_addon_example.slug,
+                "addon": install_app_example.slug,
                 "backup": True,
             }
         )

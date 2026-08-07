@@ -1,7 +1,7 @@
 """Mock of systemd dbus service."""
 
 from dbus_fast import DBusError
-from dbus_fast.service import PropertyAccess, dbus_property
+from dbus_fast.service import PropertyAccess, dbus_property, signal
 
 from .base import DBusServiceMock, dbus_method
 from .systemd_unit import SystemdUnit
@@ -28,6 +28,7 @@ class Systemd(DBusServiceMock):
     reboot_watchdog_usec = 600000000
     kexec_watchdog_usec = 0
     service_watchdogs = True
+    system_state = "running"
     virtualization = ""
     response_get_unit: (
         dict[str, list[str | DBusError]] | list[str | DBusError] | str | DBusError
@@ -41,6 +42,60 @@ class Systemd(DBusServiceMock):
         "/org/freedesktop/systemd1/job/7623"
     )
     mock_systemd_unit: SystemdUnit | None = None
+
+    @staticmethod
+    def _units() -> list[list[str | int]]:
+        """Return static unit rows in ListUnits shape."""
+        return [
+            [
+                "etc-machine\\x2did.mount",
+                "/etc/machine-id",
+                "loaded",
+                "active",
+                "mounted",
+                "",
+                "/org/freedesktop/systemd1/unit/etc_2dmachine_5cx2did_2emount",
+                0,
+                "",
+                "/",
+            ],
+            [
+                "firewalld.service",
+                "firewalld.service",
+                "not-found",
+                "inactive",
+                "dead",
+                "",
+                "/org/freedesktop/systemd1/unit/firewalld_2eservice",
+                0,
+                "",
+                "/",
+            ],
+            [
+                "sys-devices-virtual-tty-ttypd.device",
+                "/sys/devices/virtual/tty/ttypd",
+                "loaded",
+                "active",
+                "plugged",
+                "",
+                "/org/freedesktop/systemd1/unit/sys_2ddevices_2dvirtual_2dtty_2dttypd_2edevice",
+                0,
+                "",
+                "/",
+            ],
+            [
+                "zram-swap.service",
+                "HassOS ZRAM swap",
+                "loaded",
+                "active",
+                "exited",
+                "",
+                "/org/freedesktop/systemd1/unit/zram_2dswap_2eservice",
+                0,
+                "",
+                "/",
+            ],
+        ]
 
     @dbus_property(access=PropertyAccess.READ)
     def Version(self) -> "s":
@@ -401,7 +456,7 @@ class Systemd(DBusServiceMock):
     @dbus_property(access=PropertyAccess.READ)
     def SystemState(self) -> "s":
         """Get SystemState."""
-        return "running"
+        return self.system_state
 
     @dbus_property(access=PropertyAccess.READ)
     def ExitCode(self) -> "y":
@@ -657,11 +712,32 @@ class Systemd(DBusServiceMock):
         """Power off host computer."""
 
     @dbus_method()
+    def Subscribe(self) -> None:
+        """Subscribe to systemd signals."""
+
+    @signal()
+    def JobRemoved(  # noqa: PLR0913
+        self,
+        job_id: "u",
+        job: "o",
+        unit: "s",
+        result: "s",
+    ) -> "uoss":
+        """Emit JobRemoved signal with (id, job_path, unit_name, result)."""
+        return [job_id, job, unit, result]
+
+    def _emit_job_removed(self, job_path: str, unit: str, result: str = "done") -> None:
+        """Emit JobRemoved with a deterministic id placeholder."""
+        self.JobRemoved(0, job_path, unit, result)
+
+    @dbus_method()
     def StartUnit(self, name: "s", mode: "s") -> "o":
         """Start a service unit."""
         if self.mock_systemd_unit:
             self.mock_systemd_unit.active_state = "active"
-        return "/org/freedesktop/systemd1/job/7623"
+        job_path = "/org/freedesktop/systemd1/job/7623"
+        self._emit_job_removed(job_path, name)
+        return job_path
 
     @dbus_method()
     def StopUnit(self, name: "s", mode: "s") -> "o":
@@ -670,6 +746,7 @@ class Systemd(DBusServiceMock):
             raise self.response_stop_unit  # pylint: disable=raising-bad-type
         if self.mock_systemd_unit:
             self.mock_systemd_unit.active_state = "inactive"
+        self._emit_job_removed(self.response_stop_unit, name)
         return self.response_stop_unit
 
     @dbus_method()
@@ -679,6 +756,7 @@ class Systemd(DBusServiceMock):
             raise self.response_reload_or_restart_unit  # pylint: disable=raising-bad-type
         if self.mock_systemd_unit:
             self.mock_systemd_unit.active_state = "active"
+        self._emit_job_removed(self.response_reload_or_restart_unit, name)
         return self.response_reload_or_restart_unit
 
     @dbus_method()
@@ -688,6 +766,7 @@ class Systemd(DBusServiceMock):
             raise self.response_restart_unit  # pylint: disable=raising-bad-type
         if self.mock_systemd_unit:
             self.mock_systemd_unit.active_state = "active"
+        self._emit_job_removed(self.response_restart_unit, name)
         return self.response_restart_unit
 
     @dbus_method()
@@ -699,6 +778,7 @@ class Systemd(DBusServiceMock):
             raise self.response_start_transient_unit  # pylint: disable=raising-bad-type
         if self.mock_systemd_unit:
             self.mock_systemd_unit.active_state = "active"
+        self._emit_job_removed(self.response_start_transient_unit, name)
         return self.response_start_transient_unit
 
     @dbus_method()
@@ -726,53 +806,17 @@ class Systemd(DBusServiceMock):
         self,
     ) -> "a(ssssssouso)":
         """Return a list of available services."""
+        return self._units()
+
+    @dbus_method()
+    def ListUnitsFiltered(self, states: "as") -> "a(ssssssouso)":
+        """Return a list of available services filtered by state."""
+        units = self._units()
+        if not states:
+            return units
+
         return [
-            [
-                "etc-machine\\x2did.mount",
-                "/etc/machine-id",
-                "loaded",
-                "active",
-                "mounted",
-                "",
-                "/org/freedesktop/systemd1/unit/etc_2dmachine_5cx2did_2emount",
-                0,
-                "",
-                "/",
-            ],
-            [
-                "firewalld.service",
-                "firewalld.service",
-                "not-found",
-                "inactive",
-                "dead",
-                "",
-                "/org/freedesktop/systemd1/unit/firewalld_2eservice",
-                0,
-                "",
-                "/",
-            ],
-            [
-                "sys-devices-virtual-tty-ttypd.device",
-                "/sys/devices/virtual/tty/ttypd",
-                "loaded",
-                "active",
-                "plugged",
-                "",
-                "/org/freedesktop/systemd1/unit/sys_2ddevices_2dvirtual_2dtty_2dttypd_2edevice",
-                0,
-                "",
-                "/",
-            ],
-            [
-                "zram-swap.service",
-                "HassOS ZRAM swap",
-                "loaded",
-                "active",
-                "exited",
-                "",
-                "/org/freedesktop/systemd1/unit/zram_2dswap_2eservice",
-                0,
-                "",
-                "/",
-            ],
+            unit
+            for unit in units
+            if unit[2] in states or unit[3] in states or unit[4] in states
         ]

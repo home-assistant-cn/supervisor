@@ -2,10 +2,11 @@
 
 from ...const import CoreState
 from ...coresys import CoreSys
-from ...dbus.const import ConnectionStateFlags, ConnectionStateType
+from ...dbus.const import ConnectionState, ConnectionStateFlags
 from ...dbus.network.interface import NetworkInterface
 from ...exceptions import NetworkInterfaceNotFound
 from ..const import ContextType, IssueType
+from ..data import Issue
 from .base import CheckBase
 
 
@@ -27,14 +28,14 @@ class CheckNetworkInterfaceIPV4(CheckBase):
                     inet.interface_name,
                 )
 
-    async def approve_check(self, reference: str | None = None) -> bool:
+    async def approve_check(self, issue: Issue) -> bool:
         """Approve check if it is affected by issue."""
-        if not reference:
+        if not issue.reference:
             return False
 
         try:
             return CheckNetworkInterfaceIPV4.check_interface(
-                self.sys_dbus.network.get(reference)
+                self.sys_dbus.network.get(issue.reference)
             )
         except NetworkInterfaceNotFound:
             return False
@@ -47,7 +48,7 @@ class CheckNetworkInterfaceIPV4(CheckBase):
 
         return not (
             interface.connection.state
-            in [ConnectionStateType.ACTIVATED, ConnectionStateType.ACTIVATING]
+            in [ConnectionState.ACTIVATED, ConnectionState.ACTIVATING]
             and ConnectionStateFlags.IP4_READY in interface.connection.state_flags
         )
 

@@ -1,8 +1,6 @@
 """Home Assistant control object."""
 
 import asyncio
-from datetime import timedelta
-import errno
 from ipaddress import IPv4Address
 import logging
 from pathlib import Path, PurePath
@@ -13,7 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from awesomeversion import AwesomeVersion, AwesomeVersionException
-from securetar import AddFileError, atomic_contents_add, secure_path
+from securetar import AddFileError, SecureTarFile, atomic_contents_add
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
@@ -23,6 +21,7 @@ from ..const import (
     ATTR_AUDIO_OUTPUT,
     ATTR_BACKUPS_EXCLUDE_DATABASE,
     ATTR_BOOT,
+    ATTR_DUPLICATE_LOG_FILE,
     ATTR_IMAGE,
     ATTR_MESSAGE,
     ATTR_PORT,
@@ -34,11 +33,11 @@ from ..const import (
     ATTR_WATCHDOG,
     FILE_HASSIO_HOMEASSISTANT,
     BusEvent,
-    IngressSessionDataUser,
-    IngressSessionDataUserDict,
+    HomeAssistantUser,
 )
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
+    BackupInvalidError,
     ConfigurationFileError,
     HomeAssistantBackupError,
     HomeAssistantError,
@@ -46,9 +45,7 @@ from ..exceptions import (
 )
 from ..hardware.const import PolicyGroup
 from ..hardware.data import Device
-from ..jobs.const import JobConcurrency, JobThrottle
 from ..jobs.decorator import Job
-from ..resolution.const import UnhealthyReason
 from ..utils import remove_folder, remove_folder_with_excludes
 from ..utils.common import FileConfiguration
 from ..utils.json import read_json_file, write_json_file
@@ -74,6 +71,7 @@ HOMEASSISTANT_BACKUP_EXCLUDE = [
     "backups/*.tar",
     "tmp_backups/*.tar",
     "tts/*",
+    ".cache/*",
 ]
 HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE = [
     "home-assistant_v?.db",
@@ -92,6 +90,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         self._websocket: HomeAssistantWebSocket = HomeAssistantWebSocket(coresys)
         self._core: HomeAssistantCore = HomeAssistantCore(coresys)
         self._secrets: HomeAssistantSecrets = HomeAssistantSecrets(coresys)
+        self._http_server_host: list[str] | None = None
 
     @property
     def api(self) -> HomeAssistantAPI:
@@ -152,6 +151,20 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
     def api_ssl(self, value: bool):
         """Set SSL for Home Assistant instance."""
         self._data[ATTR_SSL] = value
+
+    @property
+    def http_server_host(self) -> list[str] | None:
+        """Return the hosts Core's HTTP server binds to, if known.
+
+        Pulled from Core's HTTP config over the Unix socket; None when unknown
+        (older Core). Not persisted, refreshed whenever Supervisor connects.
+        """
+        return self._http_server_host
+
+    @http_server_host.setter
+    def http_server_host(self, value: list[str] | None) -> None:
+        """Set the hosts Core's HTTP server binds to."""
+        self._http_server_host = value
 
     @property
     def api_url(self) -> str:
@@ -286,7 +299,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         """Return true if a Home Assistant update is available."""
         try:
             return self.version is not None and self.version < self.latest_version
-        except (AwesomeVersionException, TypeError):
+        except AwesomeVersionException, TypeError:
             return False
 
     @property
@@ -299,6 +312,16 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         """Set whether backups should exclude database by default."""
         self._data[ATTR_BACKUPS_EXCLUDE_DATABASE] = value
 
+    @property
+    def duplicate_log_file(self) -> bool:
+        """Return True if Home Assistant should duplicate logs to file."""
+        return self._data[ATTR_DUPLICATE_LOG_FILE]
+
+    @duplicate_log_file.setter
+    def duplicate_log_file(self, value: bool) -> None:
+        """Set whether Home Assistant should duplicate logs to file."""
+        self._data[ATTR_DUPLICATE_LOG_FILE] = value
+
     async def load(self) -> None:
         """Prepare Home Assistant object."""
         await asyncio.wait(
@@ -310,6 +333,10 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         )
 
         # Register for events
+        self.sys_bus.register_event(
+            BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
+            self._api.container_state_changed,
+        )
         self.sys_bus.register_event(BusEvent.HARDWARE_NEW_DEVICE, self._hardware_events)
         self.sys_bus.register_event(
             BusEvent.HARDWARE_REMOVE_DEVICE, self._hardware_events
@@ -330,10 +357,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         try:
             await self.sys_run_in_executor(write_pulse_config)
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             _LOGGER.error("Home Assistant can't write pulse/client.config: %s", err)
         else:
             _LOGGER.info("Update pulse/client.config: %s", self.path_pulse)
@@ -348,15 +372,23 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         ):
             return
 
-        configuration: (
-            dict[str, Any] | None
-        ) = await self.sys_homeassistant.websocket.async_send_command(
-            {ATTR_TYPE: "get_config"}
-        )
+        try:
+            configuration: (
+                dict[str, Any] | None
+            ) = await self.sys_homeassistant.websocket.async_send_command(
+                {ATTR_TYPE: "get_config"}
+            )
+        except HomeAssistantWSError as err:
+            _LOGGER.warning(
+                "Can't get Home Assistant Core configuration: %s. Not sending hardware events to Home Assistant Core.",
+                err,
+            )
+            return
+
         if not configuration or "usb" not in configuration.get("components", []):
             return
 
-        self.sys_homeassistant.websocket.send_message({ATTR_TYPE: "usb/scan"})
+        self.sys_homeassistant.websocket.send_command({ATTR_TYPE: "usb/scan"})
 
     @Job(name="home_assistant_module_begin_backup")
     async def begin_backup(self) -> None:
@@ -398,7 +430,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
 
     @Job(name="home_assistant_module_backup")
     async def backup(
-        self, tar_file: tarfile.TarFile, exclude_database: bool = False
+        self, tar_file: SecureTarFile, exclude_database: bool = False
     ) -> None:
         """Backup Home Assistant Core config/directory."""
         excludes = HOMEASSISTANT_BACKUP_EXCLUDE.copy()
@@ -458,14 +490,14 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
 
     @Job(name="home_assistant_module_restore")
     async def restore(
-        self, tar_file: tarfile.TarFile, exclude_database: bool = False
+        self, tar_file: SecureTarFile, exclude_database: bool | None = False
     ) -> None:
         """Restore Home Assistant Core config/ directory."""
 
         def _restore_home_assistant() -> Any:
             """Restores data and reads metadata from backup.
 
-            Returns: Home Assistant metdata
+            Returns: Home Assistant metadata
             """
             with TemporaryDirectory(dir=self.sys_config.path_tmp) as temp:
                 temp_path = Path(temp)
@@ -475,11 +507,16 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                 # extract backup
                 try:
                     with tar_file as backup:
+                        # The tar filter rejects path traversal and absolute names,
+                        # aborting restore of potentially crafted backups.
                         backup.extractall(
                             path=temp_path,
-                            members=secure_path(backup),
-                            filter="fully_trusted",
+                            filter="tar",
                         )
+                except tarfile.FilterError as err:
+                    raise BackupInvalidError(
+                        f"Invalid tarfile {tar_file}: {err}", _LOGGER.error
+                    ) from err
                 except tarfile.TarError as err:
                     raise HomeAssistantError(
                         f"Can't read tarfile {tar_file}: {err}", _LOGGER.error
@@ -490,14 +527,14 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                     temp_data = temp_path
 
                 _LOGGER.info("Restore Home Assistant Core config folder")
-                if exclude_database:
+                if exclude_database is True:
                     remove_folder_with_excludes(
                         self.sys_config.path_homeassistant,
                         excludes=HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE,
                         tmp_dir=self.sys_config.path_tmp,
                     )
                 else:
-                    remove_folder(self.sys_config.path_homeassistant)
+                    remove_folder(self.sys_config.path_homeassistant, content_only=True)
 
                 try:
                     shutil.copytree(
@@ -521,7 +558,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                 try:
                     data = read_json_file(temp_meta)
                 except ConfigurationFileError as err:
-                    raise HomeAssistantError() from err
+                    raise HomeAssistantError from err
 
                 return data
 
@@ -550,21 +587,12 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
             if attr in data:
                 self._data[attr] = data[attr]
 
-    @Job(
-        name="home_assistant_get_users",
-        throttle_period=timedelta(minutes=5),
-        internal=True,
-        concurrency=JobConcurrency.QUEUE,
-        throttle=JobThrottle.THROTTLE,
-    )
-    async def get_users(self) -> list[IngressSessionDataUser]:
-        """Get list of all configured users."""
-        list_of_users: (
-            list[IngressSessionDataUserDict] | None
-        ) = await self.sys_homeassistant.websocket.async_send_command(
+    async def list_users(self) -> list[HomeAssistantUser]:
+        """Fetch list of all users from Home Assistant Core via WebSocket.
+
+        Raises HomeAssistantWSError on WebSocket connection/communication failure.
+        """
+        raw: list[dict[str, Any]] = await self.websocket.async_send_command(
             {ATTR_TYPE: "config/auth/list"}
         )
-
-        if list_of_users:
-            return [IngressSessionDataUser.from_dict(data) for data in list_of_users]
-        return []
+        return [HomeAssistantUser.from_dict(data) for data in raw]

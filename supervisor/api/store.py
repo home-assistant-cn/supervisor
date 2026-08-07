@@ -7,15 +7,16 @@ from typing import Any, cast
 from aiohttp import web
 import voluptuous as vol
 
-from ..addons.addon import Addon
-from ..addons.manager import AnyAddon
-from ..addons.utils import rating_security
 from ..api.const import ATTR_SIGNED
 from ..api.utils import api_process, api_process_raw, api_validate
+from ..apps.app import App
+from ..apps.manager import AnyApp
+from ..apps.utils import rating_security
 from ..const import (
     ATTR_ADDONS,
     ATTR_ADVANCED,
     ATTR_APPARMOR,
+    ATTR_APPS,
     ATTR_ARCH,
     ATTR_AUTH_API,
     ATTR_AVAILABLE,
@@ -53,8 +54,9 @@ from ..const import (
     REQUEST_FROM,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import APIError, APIForbidden, APINotFound
-from ..store.addon import AddonStore
+from ..exceptions import APIError, APIForbidden, APINotFound, StoreAppNotFoundError
+from ..resolution.const import ContextType, SuggestionType
+from ..store.app import AppStore
 from ..store.repository import Repository
 from ..store.validate import validate_repository
 from .const import ATTR_BACKGROUND, CONTENT_TYPE_PNG, CONTENT_TYPE_TEXT
@@ -99,23 +101,23 @@ def _read_static_binary_file(path: Path) -> Any:
 class APIStore(CoreSysAttributes):
     """Handle RESTful API for store functions."""
 
-    def _extract_addon(self, request: web.Request, installed=False) -> AnyAddon:
-        """Return add-on, throw an exception it it doesn't exist."""
-        addon_slug: str = request.match_info["addon"]
+    def _extract_app(self, request: web.Request, installed=False) -> AnyApp:
+        """Return app, throw an exception it it doesn't exist."""
+        app_slug: str = request.match_info["app"]
 
-        if not (addon := self.sys_addons.get(addon_slug)):
-            raise APINotFound(f"Addon {addon_slug} does not exist")
+        if not (app := self.sys_apps.get(app_slug)):
+            raise StoreAppNotFoundError(app=app_slug)
 
-        if installed and not addon.is_installed:
-            raise APIError(f"Addon {addon_slug} is not installed")
+        if installed and not app.is_installed:
+            raise APIError(f"App {app_slug} is not installed")
 
-        if not installed and addon.is_installed:
-            addon = cast(Addon, addon)
-            if not addon.addon_store:
-                raise APINotFound(f"Addon {addon_slug} does not exist in the store")
-            return addon.addon_store
+        if not installed and app.is_installed:
+            app = cast(App, app)
+            if not app.app_store:
+                raise StoreAppNotFoundError(app=app_slug)
+            return app.app_store
 
-        return addon
+        return app
 
     def _extract_repository(self, request: web.Request) -> Repository:
         """Return repository, throw an exception it it doesn't exist."""
@@ -128,52 +130,50 @@ class APIStore(CoreSysAttributes):
 
         return self.sys_store.get(repository_slug)
 
-    async def _generate_addon_information(
-        self, addon: AddonStore, extended: bool = False
+    async def _generate_app_information(
+        self, app: AppStore, extended: bool = False
     ) -> dict[str, Any]:
-        """Generate addon information."""
+        """Generate app information."""
 
-        installed = (
-            self.sys_addons.get_local_only(addon.slug) if addon.is_installed else None
-        )
+        installed = self.sys_apps.get_local_only(app.slug) if app.is_installed else None
 
         data = {
-            ATTR_ADVANCED: addon.advanced,
-            ATTR_ARCH: addon.supported_arch,
-            ATTR_AVAILABLE: addon.available,
-            ATTR_BUILD: addon.need_build,
-            ATTR_DESCRIPTON: addon.description,
-            ATTR_DOCUMENTATION: addon.with_documentation,
-            ATTR_HOMEASSISTANT: addon.homeassistant_version,
-            ATTR_ICON: addon.with_icon,
-            ATTR_INSTALLED: addon.is_installed,
-            ATTR_LOGO: addon.with_logo,
-            ATTR_NAME: addon.name,
-            ATTR_REPOSITORY: addon.repository,
-            ATTR_SLUG: addon.slug,
-            ATTR_STAGE: addon.stage,
+            ATTR_ADVANCED: app.advanced,
+            ATTR_ARCH: app.supported_arch,
+            ATTR_AVAILABLE: app.available,
+            ATTR_BUILD: app.need_build,
+            ATTR_DESCRIPTON: app.description,
+            ATTR_DOCUMENTATION: app.with_documentation,
+            ATTR_HOMEASSISTANT: app.homeassistant_version,
+            ATTR_ICON: app.with_icon,
+            ATTR_INSTALLED: app.is_installed,
+            ATTR_LOGO: app.with_logo,
+            ATTR_NAME: app.name,
+            ATTR_REPOSITORY: app.repository,
+            ATTR_SLUG: app.slug,
+            ATTR_STAGE: app.stage,
             ATTR_UPDATE_AVAILABLE: installed.need_update if installed else False,
-            ATTR_URL: addon.url,
-            ATTR_VERSION_LATEST: addon.latest_version,
+            ATTR_URL: app.url,
+            ATTR_VERSION_LATEST: app.latest_version,
             ATTR_VERSION: installed.version if installed else None,
         }
         if extended:
             data.update(
                 {
-                    ATTR_APPARMOR: addon.apparmor,
-                    ATTR_AUTH_API: addon.access_auth_api,
-                    ATTR_DETACHED: addon.is_detached,
-                    ATTR_DOCKER_API: addon.access_docker_api,
-                    ATTR_FULL_ACCESS: addon.with_full_access,
-                    ATTR_HASSIO_API: addon.access_hassio_api,
-                    ATTR_HASSIO_ROLE: addon.hassio_role,
-                    ATTR_HOMEASSISTANT_API: addon.access_homeassistant_api,
-                    ATTR_HOST_NETWORK: addon.host_network,
-                    ATTR_HOST_PID: addon.host_pid,
-                    ATTR_INGRESS: addon.with_ingress,
-                    ATTR_LONG_DESCRIPTION: await addon.long_description(),
-                    ATTR_RATING: rating_security(addon),
-                    ATTR_SIGNED: addon.signed,
+                    ATTR_APPARMOR: app.apparmor,
+                    ATTR_AUTH_API: app.access_auth_api,
+                    ATTR_DETACHED: app.is_detached,
+                    ATTR_DOCKER_API: app.access_docker_api,
+                    ATTR_FULL_ACCESS: app.with_full_access,
+                    ATTR_HASSIO_API: app.access_hassio_api,
+                    ATTR_HASSIO_ROLE: app.hassio_role,
+                    ATTR_HOMEASSISTANT_API: app.access_homeassistant_api,
+                    ATTR_HOST_NETWORK: app.host_network,
+                    ATTR_HOST_PID: app.host_pid,
+                    ATTR_INGRESS: app.with_ingress,
+                    ATTR_LONG_DESCRIPTION: await app.long_description(),
+                    ATTR_RATING: rating_security(app),
+                    ATTR_SIGNED: app.signed,
                 }
             )
 
@@ -191,21 +191,23 @@ class APIStore(CoreSysAttributes):
             ATTR_MAINTAINER: repository.maintainer,
         }
 
+    async def _all_store_apps_info(self) -> list[dict[str, Any]]:
+        """Return info for all apps in the store."""
+        return [
+            await self._generate_app_information(self.sys_apps.store[app])
+            for app in self.sys_apps.store
+        ]
+
     @api_process
     async def reload(self, request: web.Request) -> None:
-        """Reload all add-on data from store."""
+        """Reload all app data from store."""
         await asyncio.shield(self.sys_store.reload())
 
     @api_process
     async def store_info(self, request: web.Request) -> dict[str, Any]:
-        """Return store information."""
+        """Return store information (v2: uses "apps" key)."""
         return {
-            ATTR_ADDONS: await asyncio.gather(
-                *[
-                    self._generate_addon_information(self.sys_addons.store[addon])
-                    for addon in self.sys_addons.store
-                ]
-            ),
+            ATTR_APPS: await self._all_store_apps_info(),
             ATTR_REPOSITORIES: [
                 self._generate_repository_information(repository)
                 for repository in self.sys_store.all
@@ -213,27 +215,36 @@ class APIStore(CoreSysAttributes):
         }
 
     @api_process
-    async def addons_list(self, request: web.Request) -> dict[str, Any]:
-        """Return all store add-ons."""
+    async def store_info_v1(self, request: web.Request) -> dict[str, Any]:
+        """Return store information (v1: uses "addons" key)."""
         return {
-            ATTR_ADDONS: await asyncio.gather(
-                *[
-                    self._generate_addon_information(self.sys_addons.store[addon])
-                    for addon in self.sys_addons.store
-                ]
-            )
+            ATTR_ADDONS: await self._all_store_apps_info(),
+            ATTR_REPOSITORIES: [
+                self._generate_repository_information(repository)
+                for repository in self.sys_store.all
+            ],
         }
 
     @api_process
-    async def addons_addon_install(self, request: web.Request) -> dict[str, str] | None:
-        """Install add-on."""
-        addon = self._extract_addon(request)
+    async def apps_list(self, request: web.Request) -> dict[str, Any]:
+        """Return all store apps (v2: uses "apps" key)."""
+        return {ATTR_APPS: await self._all_store_apps_info()}
+
+    @api_process
+    async def apps_list_v1(self, request: web.Request) -> dict[str, Any]:
+        """Return all store apps (v1: uses "addons" key)."""
+        return {ATTR_ADDONS: await self._all_store_apps_info()}
+
+    @api_process
+    async def apps_app_install(self, request: web.Request) -> dict[str, str] | None:
+        """Install app."""
+        app = self._extract_app(request)
         body = await api_validate(SCHEMA_INSTALL, request)
 
         background = body[ATTR_BACKGROUND]
 
         install_task, job_id = await background_task(
-            self, self.sys_addons.install, addon.slug
+            self, self.sys_apps.install, app.slug
         )
 
         if background and not install_task.done():
@@ -242,19 +253,19 @@ class APIStore(CoreSysAttributes):
         return await install_task
 
     @api_process
-    async def addons_addon_update(self, request: web.Request) -> dict[str, str] | None:
-        """Update add-on."""
-        addon = self._extract_addon(request, installed=True)
-        if addon == request.get(REQUEST_FROM):
-            raise APIForbidden(f"Add-on {addon.slug} can't update itself!")
+    async def apps_app_update(self, request: web.Request) -> dict[str, str] | None:
+        """Update app."""
+        app = self._extract_app(request, installed=True)
+        if app == request.get(REQUEST_FROM):
+            raise APIForbidden(f"App {app.slug} can't update itself!")
 
         body = await api_validate(SCHEMA_UPDATE, request)
         background = body[ATTR_BACKGROUND]
 
         update_task, job_id = await background_task(
             self,
-            self.sys_addons.update,
-            addon.slug,
+            self.sys_apps.update,
+            app.slug,
             backup=body.get(ATTR_BACKUP),
         )
 
@@ -266,71 +277,71 @@ class APIStore(CoreSysAttributes):
         return None
 
     @api_process
-    async def addons_addon_info(self, request: web.Request) -> dict[str, Any]:
-        """Return add-on information."""
-        return await self.addons_addon_info_wrapped(request)
+    async def apps_app_info(self, request: web.Request) -> dict[str, Any]:
+        """Return app information."""
+        return await self.apps_app_info_wrapped(request)
 
-    # Used by legacy routing for addons/{addon}/info, can be refactored out when that is removed (1/2023)
-    async def addons_addon_info_wrapped(self, request: web.Request) -> dict[str, Any]:
-        """Return add-on information directly (not api)."""
-        addon = cast(AddonStore, self._extract_addon(request))
-        return await self._generate_addon_information(addon, True)
-
-    @api_process_raw(CONTENT_TYPE_PNG)
-    async def addons_addon_icon(self, request: web.Request) -> bytes:
-        """Return icon from add-on."""
-        addon = self._extract_addon(request)
-        if not addon.with_icon:
-            raise APIError(f"No icon found for add-on {addon.slug}!")
-
-        return await self.sys_run_in_executor(_read_static_binary_file, addon.path_icon)
+    # Used by legacy routing for apps/{app}/info, can be refactored out when that is removed (1/2023)
+    async def apps_app_info_wrapped(self, request: web.Request) -> dict[str, Any]:
+        """Return app information directly (not api)."""
+        app = cast(AppStore, self._extract_app(request))
+        return await self._generate_app_information(app, True)
 
     @api_process_raw(CONTENT_TYPE_PNG)
-    async def addons_addon_logo(self, request: web.Request) -> bytes:
-        """Return logo from add-on."""
-        addon = self._extract_addon(request)
-        if not addon.with_logo:
-            raise APIError(f"No logo found for add-on {addon.slug}!")
+    async def apps_app_icon(self, request: web.Request) -> bytes:
+        """Return icon from app."""
+        app = self._extract_app(request)
+        if not app.with_icon:
+            raise APIError(f"No icon found for app {app.slug}!")
 
-        return await self.sys_run_in_executor(_read_static_binary_file, addon.path_logo)
+        return await self.sys_run_in_executor(_read_static_binary_file, app.path_icon)
+
+    @api_process_raw(CONTENT_TYPE_PNG)
+    async def apps_app_logo(self, request: web.Request) -> bytes:
+        """Return logo from app."""
+        app = self._extract_app(request)
+        if not app.with_logo:
+            raise APIError(f"No logo found for app {app.slug}!")
+
+        return await self.sys_run_in_executor(_read_static_binary_file, app.path_logo)
 
     @api_process_raw(CONTENT_TYPE_TEXT)
-    async def addons_addon_changelog(self, request: web.Request) -> str:
-        """Return changelog from add-on."""
+    async def apps_app_changelog(self, request: web.Request) -> str:
+        """Return changelog from app."""
         # Frontend can't handle error response here, need to return 200 and error as text for now
         try:
-            addon = self._extract_addon(request)
+            app = self._extract_app(request)
         except APIError as err:
             return str(err)
 
-        if not addon.with_changelog:
-            return f"No changelog found for add-on {addon.slug}!"
+        if not app.with_changelog:
+            return f"No changelog found for app {app.slug}!"
 
         return await self.sys_run_in_executor(
-            _read_static_text_file, addon.path_changelog
+            _read_static_text_file, app.path_changelog
         )
 
     @api_process_raw(CONTENT_TYPE_TEXT)
-    async def addons_addon_documentation(self, request: web.Request) -> str:
-        """Return documentation from add-on."""
+    async def apps_app_documentation(self, request: web.Request) -> str:
+        """Return documentation from app."""
         # Frontend can't handle error response here, need to return 200 and error as text for now
         try:
-            addon = self._extract_addon(request)
+            app = self._extract_app(request)
         except APIError as err:
             return str(err)
 
-        if not addon.with_documentation:
-            return f"No documentation found for add-on {addon.slug}!"
+        if not app.with_documentation:
+            return f"No documentation found for app {app.slug}!"
 
         return await self.sys_run_in_executor(
-            _read_static_text_file, addon.path_documentation
+            _read_static_text_file, app.path_documentation
         )
 
     @api_process
-    async def addons_addon_availability(self, request: web.Request) -> None:
-        """Check add-on availability for current system."""
-        addon = cast(AddonStore, self._extract_addon(request))
-        addon.validate_availability()
+    async def apps_app_availability(self, request: web.Request) -> None:
+        """Check app availability for current system."""
+        app = cast(AppStore, self._extract_app(request))
+        app.validate_availability()
 
     @api_process
     async def repositories_list(self, request: web.Request) -> list[dict[str, Any]]:
@@ -349,13 +360,30 @@ class APIStore(CoreSysAttributes):
         return self._generate_repository_information(repository)
 
     @api_process
-    async def add_repository(self, request: web.Request):
+    async def add_repository(self, request: web.Request) -> None:
         """Add repository to the store."""
         body = await api_validate(SCHEMA_ADD_REPOSITORY, request)
         await asyncio.shield(self.sys_store.add_repository(body[ATTR_REPOSITORY]))
 
     @api_process
-    async def remove_repository(self, request: web.Request):
+    async def remove_repository(self, request: web.Request) -> None:
         """Remove repository from the store."""
         repository: Repository = self._extract_repository(request)
         await asyncio.shield(self.sys_store.remove_repository(repository))
+
+    @api_process
+    async def repositories_repository_repair(self, request: web.Request) -> None:
+        """Repair repository."""
+        repository: Repository = self._extract_repository(request)
+        await asyncio.shield(repository.reset())
+
+        # If we have an execute reset suggestion on this repository, dismiss it and the issue
+        for suggestion in self.sys_resolution.suggestions:
+            if (
+                suggestion.type == SuggestionType.EXECUTE_RESET
+                and suggestion.context == ContextType.STORE
+                and suggestion.reference == repository.slug
+            ):
+                for issue in self.sys_resolution.issues_for_suggestion(suggestion):
+                    self.sys_resolution.dismiss_issue(issue)
+                return

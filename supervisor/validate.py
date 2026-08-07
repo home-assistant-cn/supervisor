@@ -7,7 +7,10 @@ from awesomeversion import AwesomeVersion
 import voluptuous as vol
 
 from .const import (
+    ATTR_ADDON,
     ATTR_ADDONS_CUSTOM_LIST,
+    ATTR_APP,
+    ATTR_APPS_CUSTOM_LIST,
     ATTR_AUDIO,
     ATTR_AUTO_UPDATE,
     ATTR_CHANNEL,
@@ -20,6 +23,7 @@ from .const import (
     ATTR_DISPLAYNAME,
     ATTR_DNS,
     ATTR_ENABLE_IPV6,
+    ATTR_FEATURE_FLAGS,
     ATTR_FORCE_SECURITY,
     ATTR_HASSOS,
     ATTR_HASSOS_UNRESTRICTED,
@@ -31,6 +35,7 @@ from .const import (
     ATTR_LOGGING,
     ATTR_MTU,
     ATTR_MULTICAST,
+    ATTR_NAME,
     ATTR_OBSERVER,
     ATTR_OTA,
     ATTR_PASSWORD,
@@ -46,29 +51,68 @@ from .const import (
     ATTR_VERSION,
     ATTR_WAIT_BOOT,
     SUPERVISOR_VERSION,
+    FeatureFlag,
     LogLevel,
     UpdateChannel,
 )
+from .docker.utils import get_registry_from_image
 from .utils.validate import validate_timezone
 
 # Move to store.validate when addons_repository config removed
-RE_REPOSITORY = re.compile(r"^(?P<url>[^#]+)(?:#(?P<branch>[\w\-.]+))?$")
+RE_REPOSITORY = re.compile(r"^(?P<url>[^#]+)(?:#(?P<branch>[\w\-./]+))?$")
 RE_REGISTRY = re.compile(r"^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$")
 
 # pylint: disable=no-value-for-parameter
 # pylint: disable=invalid-name
 network_port = vol.All(vol.Coerce(int), vol.Range(min=1, max=65535))
 wait_boot = vol.All(vol.Coerce(int), vol.Range(min=1, max=60))
-docker_image = vol.Match(
-    r"^([a-z0-9][a-z0-9.\-]*(:[0-9]+)?/)*?([a-z0-9{][a-z0-9.\-_{}]*/)*?([a-z0-9{][a-z0-9.\-_{}]*)$"
-)
+# Path component pattern for Docker image names (supports {arch}/{machine} templates)
+_RE_IMAGE_PATH_COMPONENT = re.compile(r"^[a-z0-9{][a-z0-9.\-_{}]*$")
+
+
+def docker_image(image: str) -> str:
+    """Validate a Docker image name without tag.
+
+    Tags are not allowed as the version/tag is managed separately.
+    Uses IMAGE_REGISTRY_REGEX from docker.utils for robust registry detection.
+    """
+    if not image or not isinstance(image, str):
+        raise vol.Invalid(f"Expected a non-empty string for docker image, got: {image}")
+
+    # Extract registry if present (handles domains, IPv4/IPv6, ports, localhost)
+    registry = get_registry_from_image(image)
+    if registry:
+        # Registry must be lowercase
+        if registry != registry.lower():
+            raise vol.Invalid(f"Docker image registry must be lowercase: {image}")
+        path = image[len(registry) + 1 :]  # Remove "registry/" prefix
+    else:
+        path = image
+
+    if not path:
+        raise vol.Invalid(f"Docker image has no name: {image}")
+
+    # Tags are not allowed - version is managed separately by the app system
+    if ":" in path:
+        raise vol.Invalid(f"Docker image must not contain a tag: {image}")
+
+    # Validate each path component (org/name)
+    for component in path.split("/"):
+        if not _RE_IMAGE_PATH_COMPONENT.match(component):
+            raise vol.Invalid(
+                f"Invalid Docker image path component '{component}' in: {image}"
+            )
+
+    return image
+
+
 uuid_match = vol.Match(r"^[0-9a-f]{32}$")
 sha256 = vol.Match(r"^[0-9a-f]{64}$")
 token = vol.Match(r"^[0-9a-f]{32,256}$")
 
 
 def version_tag(
-    value: str | None | int | float | AwesomeVersion,
+    value: str | None | float | AwesomeVersion,
 ) -> AwesomeVersion | None:
     """Validate main version handling."""
     if value is None:
@@ -156,25 +200,40 @@ SCHEMA_UPDATER_CONFIG = vol.Schema(
 )
 
 
+def _migrate_supervisor_config(data: dict) -> dict:
+    """Migrate legacy 'addons_custom_list' key to 'apps_custom_list'."""
+    # 'addons_custom_list' deprecated as of 2026.05
+    if ATTR_ADDONS_CUSTOM_LIST in data and ATTR_APPS_CUSTOM_LIST not in data:
+        data = dict(data)
+        data[ATTR_APPS_CUSTOM_LIST] = data.pop(ATTR_ADDONS_CUSTOM_LIST)
+    return data
+
+
 # pylint: disable=no-value-for-parameter
-SCHEMA_SUPERVISOR_CONFIG = vol.Schema(
-    {
-        vol.Optional(ATTR_TIMEZONE): validate_timezone,
-        vol.Optional(ATTR_LAST_BOOT): str,
-        vol.Optional(
-            ATTR_VERSION, default=AwesomeVersion(SUPERVISOR_VERSION)
-        ): version_tag,
-        vol.Optional(ATTR_IMAGE): docker_image,
-        vol.Optional(ATTR_ADDONS_CUSTOM_LIST, default=[]): repositories,
-        vol.Optional(ATTR_WAIT_BOOT, default=5): wait_boot,
-        vol.Optional(ATTR_LOGGING, default=LogLevel.INFO): vol.Coerce(LogLevel),
-        vol.Optional(ATTR_DEBUG, default=False): vol.Boolean(),
-        vol.Optional(ATTR_DEBUG_BLOCK, default=False): vol.Boolean(),
-        vol.Optional(ATTR_DIAGNOSTICS, default=None): vol.Maybe(vol.Boolean()),
-        vol.Optional(ATTR_DETECT_BLOCKING_IO, default=False): vol.Boolean(),
-        vol.Optional(ATTR_COUNTRY): str,
-    },
-    extra=vol.REMOVE_EXTRA,
+SCHEMA_SUPERVISOR_CONFIG = vol.All(
+    _migrate_supervisor_config,
+    vol.Schema(
+        {
+            vol.Optional(ATTR_TIMEZONE): validate_timezone,
+            vol.Optional(ATTR_LAST_BOOT): str,
+            vol.Optional(
+                ATTR_VERSION, default=AwesomeVersion(SUPERVISOR_VERSION)
+            ): version_tag,
+            vol.Optional(ATTR_IMAGE): docker_image,
+            vol.Optional(ATTR_APPS_CUSTOM_LIST, default=[]): repositories,
+            vol.Optional(ATTR_WAIT_BOOT, default=5): wait_boot,
+            vol.Optional(ATTR_LOGGING, default=LogLevel.INFO): vol.Coerce(LogLevel),
+            vol.Optional(ATTR_DEBUG, default=False): vol.Boolean(),
+            vol.Optional(ATTR_DEBUG_BLOCK, default=False): vol.Boolean(),
+            vol.Optional(ATTR_DIAGNOSTICS, default=None): vol.Maybe(vol.Boolean()),
+            vol.Optional(ATTR_DETECT_BLOCKING_IO, default=False): vol.Boolean(),
+            vol.Optional(ATTR_COUNTRY): str,
+            vol.Optional(ATTR_FEATURE_FLAGS, default=dict): vol.Schema(
+                {vol.Coerce(FeatureFlag): vol.Boolean()}
+            ),
+        },
+        extra=vol.REMOVE_EXTRA,
+    ),
 )
 
 
@@ -206,7 +265,9 @@ SCHEMA_SESSION_DATA = vol.Schema(
                     {
                         vol.Required(ATTR_ID): str,
                         vol.Required(ATTR_USERNAME, default=None): vol.Maybe(str),
-                        vol.Required(ATTR_DISPLAYNAME, default=None): vol.Maybe(str),
+                        vol.Required(ATTR_NAME, default=None): vol.Maybe(str),
+                        # Legacy key, replaced by ATTR_NAME
+                        vol.Optional(ATTR_DISPLAYNAME): vol.Maybe(str),
                     }
                 )
             }
@@ -233,3 +294,12 @@ SCHEMA_SECURITY_CONFIG = vol.Schema(
     },
     extra=vol.REMOVE_EXTRA,
 )
+
+
+def migrate_addon_to_app(data: dict) -> dict:
+    """Migrate legacy 'addon' key to 'app' for backwards compatibility."""
+    # 'addon' field deprecated as of 2026.05
+    if ATTR_ADDON in data and ATTR_APP not in data:
+        data = dict(data)
+        data[ATTR_APP] = data.pop(ATTR_ADDON)
+    return data

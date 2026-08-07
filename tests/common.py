@@ -1,7 +1,7 @@
 """Common test functions."""
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from functools import partial
 from importlib import import_module
@@ -12,11 +12,85 @@ from typing import Any, Self
 
 from dbus_fast.aio.message_bus import MessageBus
 
+from supervisor.apps.app import App
+from supervisor.const import AppState, BusEvent
+from supervisor.coresys import CoreSys
+from supervisor.docker.const import ContainerState
 from supervisor.jobs.decorator import Job
 from supervisor.resolution.validate import get_valid_modules
 from supervisor.utils.yaml import read_yaml_file
 
 from .dbus_service_mocks.base import DBusServiceMock
+
+
+def force_app_state(app: App, state: AppState) -> None:
+    """Drive an app's derived state to ``state`` by setting underlying signals.
+
+    The ``App.state`` value is derived from the last observed container
+    state and a momentary operation-error signal. Tests sometimes need a
+    specific AppState as setup without spinning up real Docker events;
+    this helper maps each AppState back to plausible signals and routes
+    them through the normal state update path.
+    """
+    # pylint: disable=protected-access
+    container_state: ContainerState | None = None
+    operation_error = False
+    match state:
+        case AppState.UNKNOWN:
+            # The derivation falls back to STOPPED when ``instance.attached``
+            # is true; clear the docker metadata so the helper is
+            # deterministic regardless of prior fixture setup.
+            app.instance._meta = None
+            container_state = ContainerState.UNKNOWN
+        case AppState.STOPPED:
+            container_state = ContainerState.STOPPED
+        case AppState.STARTED:
+            container_state = ContainerState.HEALTHY
+        case AppState.STARTUP:
+            container_state = ContainerState.RUNNING
+            # STARTUP only resolves from RUNNING when the container has a
+            # healthcheck configured; ensure one is present in the mocked
+            # container metadata.
+            meta = app.instance._meta or {}
+            meta.setdefault("Config", {})["Healthcheck"] = {"Test": ["CMD", "true"]}
+            app.instance._meta = meta
+        case AppState.ERROR:
+            operation_error = True
+    app._update_state(container_state=container_state, operation_error=operation_error)
+
+
+async def fire_bus_event(coresys: CoreSys, event: BusEvent, data: Any) -> None:
+    """Fire a bus event and await its listener tasks.
+
+    ``Bus.fire_event`` is sync and returns the listener tasks it spawned.
+    Tests that drive a system under test by firing a bus event need to
+    wait for those listener tasks to finish before asserting; this helper
+    bundles the gather so call sites stay short.
+    """
+    await asyncio.gather(*coresys.bus.fire_event(event, data))
+
+
+async def wait_for(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.01,
+) -> None:
+    """Poll a synchronous predicate until truthy or the deadline elapses.
+
+    Useful when a test fires a D-Bus signal (or another out-of-band
+    trigger) and needs to observe state mutated by the resulting async
+    chain — e.g. a signal handler that schedules its own follow-up
+    tasks. Completes the moment the predicate is true, so the wait
+    costs only what's actually needed; this avoids the choice between a
+    fixed sleep that's fast on idle and racy under load and a fixed
+    sleep that's robust under load and wasteful on idle.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"Predicate did not become true within {timeout}s")
+        await asyncio.sleep(interval)
 
 
 def get_fixture_path(filename: str) -> Path:
@@ -164,4 +238,4 @@ class AsyncIterator:
         try:
             return next(self.iter)
         except StopIteration:
-            raise StopAsyncIteration() from None
+            raise StopAsyncIteration from None

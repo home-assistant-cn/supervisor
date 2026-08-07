@@ -1,23 +1,25 @@
 """Test store manager."""
 
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.addons.addon import Addon
-from supervisor.arch import CpuArch
+from supervisor.apps.app import App
+from supervisor.arch import CpuArchManager
 from supervisor.backups.manager import BackupManager
 from supervisor.coresys import CoreSys
-from supervisor.exceptions import AddonNotSupportedError, StoreJobError
+from supervisor.exceptions import AppNotSupportedError, StoreJobError
+from supervisor.homeassistant.const import WSEvent
 from supervisor.homeassistant.module import HomeAssistant
 from supervisor.store import StoreManager
-from supervisor.store.addon import AddonStore
+from supervisor.store.app import AppStore
 from supervisor.store.git import GitRepo
-from supervisor.store.repository import Repository
+from supervisor.store.repository import Repository, RepositoryGit
 
 from tests.common import load_yaml_fixture
 
@@ -27,16 +29,16 @@ async def test_default_load(coresys: CoreSys):
     store_manager = await StoreManager(coresys).load_config()
     refresh_cache_calls: set[str] = set()
 
-    async def mock_refresh_cache(obj: AddonStore):
+    async def mock_refresh_cache(obj: AppStore):
         nonlocal refresh_cache_calls
         refresh_cache_calls.add(obj.slug)
 
     with (
         patch("supervisor.store.repository.RepositoryGit.load", return_value=None),
         patch("supervisor.store.repository.RepositoryLocal.load", return_value=None),
-        patch.object(type(coresys.config), "addons_repositories", return_value=[]),
+        patch.object(type(coresys.config), "apps_repositories", return_value=[]),
         patch("pathlib.Path.exists", return_value=True),
-        patch.object(AddonStore, "refresh_path_cache", new=mock_refresh_cache),
+        patch.object(AppStore, "refresh_path_cache", new=mock_refresh_cache),
     ):
         await store_manager.load()
 
@@ -56,7 +58,7 @@ async def test_default_load(coresys: CoreSys):
         "https://github.com/music-assistant/home-assistant-addon"
         in store_manager.repository_urls
     )
-    # NOTE: When adding new stores, make sure to add it to tests/fixtures/addons/git/
+    # NOTE: When adding new stores, make sure to add it to tests/fixtures/apps/git/
     assert refresh_cache_calls == {
         "local_ssh",
         "local_example",
@@ -83,13 +85,13 @@ async def test_load_with_custom_repository(coresys: CoreSys):
     with (
         patch("supervisor.store.repository.RepositoryGit.load", return_value=None),
         patch("supervisor.store.repository.RepositoryLocal.load", return_value=None),
-        patch.object(type(coresys.config), "addons_repositories", return_value=[]),
+        patch.object(type(coresys.config), "apps_repositories", return_value=[]),
         patch("supervisor.store.repository.RepositoryGit.validate", return_value=True),
         patch(
             "supervisor.store.repository.RepositoryLocal.validate", return_value=True
         ),
         patch("pathlib.Path.exists", return_value=True),
-        patch.object(AddonStore, "refresh_path_cache", new=mock_refresh_cache),
+        patch.object(AppStore, "refresh_path_cache", new=mock_refresh_cache),
     ):
         await store_manager.load()
 
@@ -124,46 +126,46 @@ async def test_reload_fails_if_out_of_date(coresys: CoreSys):
 
 
 @pytest.mark.parametrize(
-    "config,log",
+    ("config", "log"),
     [
         (
-            {"arch": ["i386"]},
-            "Add-on local_ssh not supported on this platform, supported architectures: i386",
+            {"arch": ["aarch64"]},
+            "App Terminal & SSH not supported on this platform, supported architectures: aarch64",
         ),
         (
             {"machine": ["odroid-n2"]},
-            "Add-on local_ssh not supported on this machine, supported machine types: odroid-n2",
+            "App Terminal & SSH not supported on this machine, supported machine types: odroid-n2",
         ),
         (
             {"machine": ["!qemux86-64"]},
-            "Add-on local_ssh not supported on this machine, supported machine types: !qemux86-64",
+            "App Terminal & SSH not supported on this machine, supported machine types: !qemux86-64",
         ),
         (
             {"homeassistant": AwesomeVersion("2023.1.1")},
-            "Add-on local_ssh not supported on this system, requires Home Assistant version 2023.1.1 or greater",
+            "App Terminal & SSH not supported on this system, requires Home Assistant version 2023.1.1 or greater",
         ),
     ],
 )
-async def test_update_unavailable_addon(
+async def test_update_unavailable_app(
     coresys: CoreSys,
-    install_addon_ssh: Addon,
+    install_app_ssh: App,
     caplog: pytest.LogCaptureFixture,
     config: dict[str, Any],
     log: str,
 ):
-    """Test updating addon when new version not available for system."""
-    addon_config = dict(
-        await coresys.run_in_executor(
-            load_yaml_fixture, "addons/local/ssh/config.yaml"
-        ),
+    """Test updating app when new version not available for system."""
+    app_config = dict(
+        await coresys.run_in_executor(load_yaml_fixture, "apps/local/ssh/config.yaml"),
         version=AwesomeVersion("10.0.0"),
         **config,
     )
 
     with (
         patch.object(BackupManager, "do_backup_partial") as backup,
-        patch.object(AddonStore, "data", new=PropertyMock(return_value=addon_config)),
-        patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])),
+        patch.object(AppStore, "data", new=PropertyMock(return_value=app_config)),
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
         patch.object(CoreSys, "machine", new=PropertyMock(return_value="qemux86-64")),
         patch.object(
             HomeAssistant,
@@ -172,8 +174,8 @@ async def test_update_unavailable_addon(
         ),
         patch("shutil.disk_usage", return_value=(42, 42, (5120.0**3))),
     ):
-        with pytest.raises(AddonNotSupportedError):
-            await coresys.addons.update("local_ssh", backup=True)
+        with pytest.raises(AppNotSupportedError):
+            await coresys.apps.update("local_ssh", backup=True)
 
         backup.assert_not_called()
 
@@ -181,45 +183,45 @@ async def test_update_unavailable_addon(
 
 
 @pytest.mark.parametrize(
-    "config,log",
+    ("config", "log"),
     [
         (
-            {"arch": ["i386"]},
-            "Add-on local_ssh not supported on this platform, supported architectures: i386",
+            {"arch": ["aarch64"]},
+            "App Terminal & SSH not supported on this platform, supported architectures: aarch64",
         ),
         (
             {"machine": ["odroid-n2"]},
-            "Add-on local_ssh not supported on this machine, supported machine types: odroid-n2",
+            "App Terminal & SSH not supported on this machine, supported machine types: odroid-n2",
         ),
         (
             {"machine": ["!qemux86-64"]},
-            "Add-on local_ssh not supported on this machine, supported machine types: !qemux86-64",
+            "App Terminal & SSH not supported on this machine, supported machine types: !qemux86-64",
         ),
         (
             {"homeassistant": AwesomeVersion("2023.1.1")},
-            "Add-on local_ssh not supported on this system, requires Home Assistant version 2023.1.1 or greater",
+            "App Terminal & SSH not supported on this system, requires Home Assistant version 2023.1.1 or greater",
         ),
     ],
 )
-async def test_install_unavailable_addon(
+async def test_install_unavailable_app(
     coresys: CoreSys,
     test_repository: Repository,
     caplog: pytest.LogCaptureFixture,
     config: dict[str, Any],
     log: str,
 ):
-    """Test updating addon when new version not available for system."""
-    addon_config = dict(
-        await coresys.run_in_executor(
-            load_yaml_fixture, "addons/local/ssh/config.yaml"
-        ),
+    """Test updating app when new version not available for system."""
+    app_config = dict(
+        await coresys.run_in_executor(load_yaml_fixture, "apps/local/ssh/config.yaml"),
         version=AwesomeVersion("10.0.0"),
         **config,
     )
 
     with (
-        patch.object(AddonStore, "data", new=PropertyMock(return_value=addon_config)),
-        patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])),
+        patch.object(AppStore, "data", new=PropertyMock(return_value=app_config)),
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
         patch.object(CoreSys, "machine", new=PropertyMock(return_value="qemux86-64")),
         patch.object(
             HomeAssistant,
@@ -227,9 +229,9 @@ async def test_install_unavailable_addon(
             new=PropertyMock(return_value=AwesomeVersion("2022.1.1")),
         ),
         patch("shutil.disk_usage", return_value=(42, 42, (5120.0**3))),
-        pytest.raises(AddonNotSupportedError),
+        pytest.raises(AppNotSupportedError),
     ):
-        await coresys.addons.install("local_ssh")
+        await coresys.apps.install("local_ssh")
 
     assert log in caplog.text
 
@@ -246,17 +248,48 @@ async def test_reload(coresys: CoreSys, supervisor_internet):
         assert git_pull.call_count == 4
 
 
-async def test_addon_version_timestamp(coresys: CoreSys, install_addon_example: Addon):
-    """Test timestamp tracked for addon's version."""
+async def test_reload_fires_store_reloaded_event(
+    coresys: CoreSys, supervisor_internet, ha_ws_client: AsyncMock
+) -> None:
+    """Test reload fires a store_reloaded event for the updated repositories."""
+    await coresys.store.load()
+
+    def _store_reloaded_events() -> list[dict[str, Any]]:
+        return [
+            call.args[0]["data"]["data"]
+            for call in ha_ws_client.async_send_command.call_args_list
+            if call.args[0].get("data", {}).get("event") == WSEvent.STORE_RELOADED
+        ]
+
+    # No repository reports an update, so no event is fired
+    with patch.object(RepositoryGit, "update", return_value=False):
+        await coresys.store.reload()
+        await asyncio.sleep(0)
+    assert _store_reloaded_events() == []
+
+    # A repository update fires exactly one event listing the updated repos
+    with patch.object(RepositoryGit, "update", return_value=True):
+        await coresys.store.reload()
+        await asyncio.sleep(0)
+
+    events = _store_reloaded_events()
+    assert len(events) == 1
+    assert set(events[0]["repositories"]) == {
+        repo.slug for repo in coresys.store.all if isinstance(repo, RepositoryGit)
+    }
+
+
+async def test_app_version_timestamp(coresys: CoreSys, install_app_example: App):
+    """Test timestamp tracked for app's version."""
     # When unset, version timestamp set to utcnow on store load
-    assert (timestamp := install_addon_example.latest_version_timestamp)
+    assert (timestamp := install_app_example.latest_version_timestamp)
 
     # Reload of the store does not change timestamp unless version changes
     await coresys.store.reload()
-    assert timestamp == install_addon_example.latest_version_timestamp
+    assert timestamp == install_app_example.latest_version_timestamp
 
     # If a new version is seen processing repo, reset to utc now
-    install_addon_example.data_store["version"] = "1.1.0"
+    install_app_example.data_store["version"] = "1.1.0"
 
     with patch(
         "pathlib.Path.stat",
@@ -265,4 +298,4 @@ async def test_addon_version_timestamp(coresys: CoreSys, install_addon_example: 
         ),
     ):
         await coresys.store.reload()
-    assert timestamp < install_addon_example.latest_version_timestamp
+    assert timestamp < install_app_example.latest_version_timestamp

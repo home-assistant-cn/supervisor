@@ -1,8 +1,9 @@
 """Init file for Supervisor util for RESTful API."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import json
+import logging
 from typing import Any, cast
 
 from aiohttp import web
@@ -26,12 +27,50 @@ from ..const import (
     RESULT_OK,
 )
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import APIError, BackupFileNotFoundError, DockerAPIError, HassioError
+from ..exceptions import APIError, HassioError
 from ..jobs import JobSchedulerOptions, SupervisorJob
-from ..utils import check_exception_chain, get_message_from_exception_chain
+from ..utils import get_message_from_exception_chain
 from ..utils.json import json_dumps, json_loads as json_loads_util
-from ..utils.log_format import format_message
+from ..utils.sentry import async_capture_exception
 from . import const
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+# V1 compatibility shim for three AppNotSupported* errors whose legacy
+# addon_* keys are still consumed by the Supervisor client library.
+_V1_LEGACY_ERROR_KEY_MAP: dict[str, str] = {
+    "app_not_supported_architecture_error": "addon_not_supported_architecture_error",
+    "app_not_supported_machine_type_error": "addon_not_supported_machine_type_error",
+    "app_not_supported_home_assistant_version_error": "addon_not_supported_home_assistant_version_error",
+}
+
+
+def _request_from_handler_args(args: tuple[Any, ...]) -> Request | None:
+    """Extract aiohttp Request from handler args.
+
+    aiohttp invokes route handlers as handler(request). For bound methods,
+    Python binds self first, so args are (self, request).
+    """
+    if args and isinstance(args[0], Request):
+        return args[0]
+
+    if len(args) > 1:
+        return cast(Request, args[1])
+
+    return None
+
+
+def _is_v2_request(request: Request | None) -> bool:
+    """Return True when request targets the v2 sub-app."""
+    return bool(request and request.path.startswith("/v2/"))
+
+
+def _response_error_key(error_key: str, request: Request | None) -> str:
+    """Return mapped error key for the request API version."""
+    if _is_v2_request(request):
+        return error_key
+
+    return _V1_LEGACY_ERROR_KEY_MAP.get(error_key, error_key)
 
 
 def extract_supervisor_token(request: web.Request) -> str | None:
@@ -63,18 +102,24 @@ def json_loads(data: Any) -> dict[str, Any]:
 def api_process(method):
     """Wrap function with true/false calls to rest api."""
 
-    async def wrap_api(
-        api: CoreSysAttributes, *args, **kwargs
-    ) -> web.Response | web.StreamResponse:
+    async def wrap_api(*args, **kwargs) -> web.Response | web.StreamResponse:
         """Return API information."""
         try:
-            answer = await method(api, *args, **kwargs)
-        except BackupFileNotFoundError as err:
-            return api_return_error(err, status=404)
+            answer = await method(*args, **kwargs)
         except APIError as err:
-            return api_return_error(err, status=err.status, job_id=err.job_id)
+            request = _request_from_handler_args(args)
+            return api_return_error(
+                err,
+                status=err.status,
+                job_id=err.job_id,
+                headers=err.headers,
+                request=request,
+            )
         except HassioError as err:
-            return api_return_error(err)
+            _LOGGER.exception("Unexpected error during API call: %s", err)
+            await async_capture_exception(err)
+            request = _request_from_handler_args(args)
+            return api_return_error(err, request=request)
 
         if isinstance(answer, (dict, list)):
             return api_return_ok(data=answer)
@@ -82,7 +127,7 @@ def api_process(method):
             return answer
         if isinstance(answer, web.StreamResponse):
             return answer
-        elif isinstance(answer, bool) and not answer:
+        if isinstance(answer, bool) and not answer:
             return api_return_error()
         return api_return_ok()
 
@@ -97,7 +142,7 @@ def require_home_assistant(method):
         coresys: CoreSys = api.coresys
         request: Request = args[0]
         if request[REQUEST_FROM] != coresys.homeassistant:
-            raise HTTPUnauthorized()
+            raise HTTPUnauthorized
         return await method(api, *args, **kwargs)
 
     return wrap_api
@@ -109,22 +154,27 @@ def api_process_raw(content, *, error_type=None):
     def wrap_method(method):
         """Wrap function with raw output to rest api."""
 
-        async def wrap_api(
-            api: CoreSysAttributes, *args, **kwargs
-        ) -> web.Response | web.StreamResponse:
+        async def wrap_api(*args, **kwargs) -> web.Response | web.StreamResponse:
             """Return api information."""
             try:
-                msg_data = await method(api, *args, **kwargs)
+                msg_data = await method(*args, **kwargs)
             except APIError as err:
+                request = _request_from_handler_args(args)
                 return api_return_error(
                     err,
                     error_type=error_type or const.CONTENT_TYPE_BINARY,
                     status=err.status,
                     job_id=err.job_id,
+                    request=request,
                 )
             except HassioError as err:
+                _LOGGER.exception("Unexpected error during API call: %s", err)
+                await async_capture_exception(err)
+                request = _request_from_handler_args(args)
                 return api_return_error(
-                    err, error_type=error_type or const.CONTENT_TYPE_BINARY
+                    err,
+                    error_type=error_type or const.CONTENT_TYPE_BINARY,
+                    request=request,
                 )
 
             if isinstance(msg_data, (web.Response, web.StreamResponse)):
@@ -143,22 +193,27 @@ def api_return_error(
     error_type: str | None = None,
     status: int = 400,
     *,
+    headers: Mapping[str, str] | None = None,
     job_id: str | None = None,
+    request: Request | None = None,
 ) -> web.Response:
     """Return an API error message."""
     if error and not message:
         message = get_message_from_exception_chain(error)
-        if check_exception_chain(error, DockerAPIError):
-            message = format_message(message)
     if not message:
-        message = "Unknown error, see Supervisor logs (check with 'ha supervisor logs')"
+        message = "Unknown error, see Supervisor logs"
 
     match error_type:
         case const.CONTENT_TYPE_TEXT:
-            return web.Response(body=message, content_type=error_type, status=status)
+            return web.Response(
+                body=message, content_type=error_type, status=status, headers=headers
+            )
         case const.CONTENT_TYPE_BINARY:
             return web.Response(
-                body=message.encode(), content_type=error_type, status=status
+                body=message.encode(),
+                content_type=error_type,
+                status=status,
+                headers=headers,
             )
         case _:
             result: dict[str, Any] = {
@@ -168,7 +223,7 @@ def api_return_error(
             if job_id:
                 result[JSON_JOB_ID] = job_id
             if error and error.error_key:
-                result[JSON_ERROR_KEY] = error.error_key
+                result[JSON_ERROR_KEY] = _response_error_key(error.error_key, request)
             if error and error.extra_fields:
                 result[JSON_EXTRA_FIELDS] = error.extra_fields
 
@@ -176,6 +231,7 @@ def api_return_error(
         result,
         status=status,
         dumps=json_dumps,
+        headers=headers,
     )
 
 

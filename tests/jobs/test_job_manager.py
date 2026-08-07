@@ -76,10 +76,10 @@ async def test_update_job(coresys: CoreSys):
     job.stage = "stage"
     assert job.stage == "stage"
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must be <= 100"):
         job.progress = 110
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must be >= 0"):
         job.progress = -10
 
 
@@ -198,8 +198,10 @@ async def test_notify_on_change(coresys: CoreSys, ha_ws_client: AsyncMock):
                         "errors": [
                             {
                                 "type": "HassioError",
-                                "message": "Unknown error, see Supervisor logs (check with 'ha supervisor logs')",
+                                "message": "Unknown error, see Supervisor logs",
                                 "stage": "test",
+                                "error_key": None,
+                                "extra_fields": None,
                             }
                         ],
                         "created": ANY,
@@ -226,8 +228,10 @@ async def test_notify_on_change(coresys: CoreSys, ha_ws_client: AsyncMock):
                     "errors": [
                         {
                             "type": "HassioError",
-                            "message": "Unknown error, see Supervisor logs (check with 'ha supervisor logs')",
+                            "message": "Unknown error, see Supervisor logs",
                             "stage": "test",
+                            "error_key": None,
+                            "extra_fields": None,
                         }
                     ],
                     "created": ANY,

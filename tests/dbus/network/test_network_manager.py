@@ -6,7 +6,7 @@ from unittest.mock import Mock, PropertyMock, patch
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
 
-from supervisor.dbus.const import ConnectionStateType
+from supervisor.dbus.const import ConnectionState
 from supervisor.dbus.network import NetworkManager
 from supervisor.dbus.network.interface import NetworkInterface
 from supervisor.exceptions import (
@@ -30,7 +30,7 @@ async def fixture_network_manager_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> NetworkManagerService:
     """Mock NetworkManager dbus service."""
-    yield network_manager_services["network_manager"]
+    return network_manager_services["network_manager"]
 
 
 async def test_network_manager(
@@ -93,7 +93,7 @@ async def test_activate_connection(
         "/org/freedesktop/NetworkManager/Settings/1",
         "/org/freedesktop/NetworkManager/Devices/1",
     )
-    assert connection.state == ConnectionStateType.ACTIVATED
+    assert connection.state == ConnectionState.ACTIVATED
     assert (
         connection.settings.object_path == "/org/freedesktop/NetworkManager/Settings/1"
     )
@@ -117,7 +117,7 @@ async def test_add_and_activate_connection(
     )
     assert settings.connection.uuid == "0c23631e-2118-355c-bbb0-8943229cb0d6"
     assert settings.ipv4.method == "auto"
-    assert connection.state == ConnectionStateType.ACTIVATED
+    assert connection.state == ConnectionState.ACTIVATED
     assert (
         connection.settings.object_path == "/org/freedesktop/NetworkManager/Settings/1"
     )
@@ -163,13 +163,13 @@ async def test_handling_bad_devices(
         )
         assert f"Can't process {device}" not in caplog.text
 
-    # Unparseable introspections shouldn't happen, this one is logged and captured
+    # Unparsable introspections shouldn't happen, this one is logged and captured
     await network_manager.update()
     with patch.object(DBus, "init_proxy", side_effect=(err := DBusParseError())):
         await network_manager.update(
             {"Devices": [device := "/org/freedesktop/NetworkManager/Devices/102"]}
         )
-        assert f"Unkown error while processing {device}" in caplog.text
+        assert f"Unknown error while processing {device}" in caplog.text
         capture_exception.assert_called_once_with(err)
 
     # We should be able to debug these situations if necessary

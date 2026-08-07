@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import errno
-from io import IOBase
+from io import BufferedWriter
 import logging
 from pathlib import Path
 import re
@@ -21,6 +20,7 @@ from ..backups.const import LOCATION_CLOUD_BACKUP, LOCATION_TYPE
 from ..backups.validate import ALL_FOLDERS, FOLDER_HOMEASSISTANT, days_until_stale
 from ..const import (
     ATTR_ADDONS,
+    ATTR_APPS,
     ATTR_BACKUPS,
     ATTR_COMPRESSED,
     ATTR_CONTENT,
@@ -44,12 +44,12 @@ from ..const import (
     ATTR_TIMEOUT,
     ATTR_TYPE,
     ATTR_VERSION,
+    DEFAULT_CHUNK_SIZE,
     REQUEST_FROM,
 )
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIError, APIForbidden, APINotFound
 from ..mounts.const import MountUsage
-from ..resolution.const import UnhealthyReason
 from .const import (
     ATTR_ADDITIONAL_LOCATIONS,
     ATTR_BACKGROUND,
@@ -61,7 +61,7 @@ from .utils import api_process, api_validate, background_task
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-ALL_ADDONS_FLAG = "ALL"
+ALL_APPS_FLAG = "ALL"
 
 LOCATION_LOCAL = ".local"
 
@@ -100,10 +100,20 @@ SCHEMA_RESTORE_FULL = vol.Schema(
     }
 )
 
-SCHEMA_RESTORE_PARTIAL = SCHEMA_RESTORE_FULL.extend(
+# V1 schemas use "addons" as the request body key (legacy API contract).
+SCHEMA_RESTORE_PARTIAL_V1 = SCHEMA_RESTORE_FULL.extend(
     {
         vol.Optional(ATTR_HOMEASSISTANT): vol.Boolean(),
         vol.Optional(ATTR_ADDONS): vol.All([str], vol.Unique()),
+        vol.Optional(ATTR_FOLDERS): SCHEMA_FOLDERS,
+    }
+)
+
+# V2 schemas use "apps" as the request body key.
+SCHEMA_RESTORE_PARTIAL = SCHEMA_RESTORE_FULL.extend(
+    {
+        vol.Optional(ATTR_HOMEASSISTANT): vol.Boolean(),
+        vol.Optional(ATTR_APPS): vol.All([str], vol.Unique()),
         vol.Optional(ATTR_FOLDERS): SCHEMA_FOLDERS,
     }
 )
@@ -121,11 +131,19 @@ SCHEMA_BACKUP_FULL = vol.Schema(
     }
 )
 
+# V1 schema uses "addons" as the request body key (legacy API contract).
+SCHEMA_BACKUP_PARTIAL_V1 = SCHEMA_BACKUP_FULL.extend(
+    {
+        vol.Optional(ATTR_ADDONS): vol.Or(ALL_APPS_FLAG, vol.All([str], vol.Unique())),
+        vol.Optional(ATTR_FOLDERS): SCHEMA_FOLDERS,
+        vol.Optional(ATTR_HOMEASSISTANT): vol.Boolean(),
+    }
+)
+
+# V2 schema uses "apps" as the request body key.
 SCHEMA_BACKUP_PARTIAL = SCHEMA_BACKUP_FULL.extend(
     {
-        vol.Optional(ATTR_ADDONS): vol.Or(
-            ALL_ADDONS_FLAG, vol.All([str], vol.Unique())
-        ),
+        vol.Optional(ATTR_APPS): vol.Or(ALL_APPS_FLAG, vol.All([str], vol.Unique())),
         vol.Optional(ATTR_FOLDERS): SCHEMA_FOLDERS,
         vol.Optional(ATTR_HOMEASSISTANT): vol.Boolean(),
     }
@@ -156,8 +174,8 @@ class APIBackups(CoreSysAttributes):
             for loc in backup.locations
         }
 
-    def _list_backups(self):
-        """Return list of backups."""
+    def _list_backups(self) -> list[dict[str, Any]]:
+        """Return list of backups using v2 field names (content["apps"])."""
         return [
             {
                 ATTR_SLUG: backup.slug,
@@ -173,7 +191,7 @@ class APIBackups(CoreSysAttributes):
                 ATTR_COMPRESSED: backup.compressed,
                 ATTR_CONTENT: {
                     ATTR_HOMEASSISTANT: backup.homeassistant_version is not None,
-                    ATTR_ADDONS: backup.addon_list,
+                    ATTR_APPS: backup.app_list,
                     ATTR_FOLDERS: backup.folders,
                 },
             }
@@ -181,57 +199,27 @@ class APIBackups(CoreSysAttributes):
             if backup.location != LOCATION_CLOUD_BACKUP
         ]
 
-    @api_process
-    async def list_backups(self, request):
-        """Return backup list."""
-        data_backups = self._list_backups()
+    @staticmethod
+    def _rename_apps_to_addons_in_backups(
+        data_backups: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Rename the content["apps"] key to content["addons"] for v1 responses."""
+        for backup in data_backups:
+            content = backup[ATTR_CONTENT]
+            content[ATTR_ADDONS] = content.pop(ATTR_APPS)
+        return data_backups
 
-        if request.path == "/snapshots":
-            # Kept for backwards compability
-            return {"snapshots": data_backups}
-
-        return {ATTR_BACKUPS: data_backups}
-
-    @api_process
-    async def info(self, request):
-        """Return backup list and manager info."""
-        return {
-            ATTR_BACKUPS: self._list_backups(),
-            ATTR_DAYS_UNTIL_STALE: self.sys_backups.days_until_stale,
-        }
-
-    @api_process
-    async def options(self, request):
-        """Set backup manager options."""
-        body = await api_validate(SCHEMA_OPTIONS, request)
-
-        if ATTR_DAYS_UNTIL_STALE in body:
-            self.sys_backups.days_until_stale = body[ATTR_DAYS_UNTIL_STALE]
-
-        await self.sys_backups.save_data()
-
-    @api_process
-    async def reload(self, _):
-        """Reload backup list."""
-        await asyncio.shield(self.sys_backups.reload())
-        return True
-
-    @api_process
-    async def backup_info(self, request):
-        """Return backup info."""
-        backup = self._extract_slug(request)
-
-        data_addons = []
-        for addon_data in backup.addons:
-            data_addons.append(
-                {
-                    ATTR_SLUG: addon_data[ATTR_SLUG],
-                    ATTR_NAME: addon_data[ATTR_NAME],
-                    ATTR_VERSION: addon_data[ATTR_VERSION],
-                    ATTR_SIZE: addon_data[ATTR_SIZE],
-                }
-            )
-
+    def _backup_info_data(self, backup: Backup) -> dict[str, Any]:
+        """Return backup info dict using v2 field names (top-level "apps")."""
+        data_apps = [
+            {
+                ATTR_SLUG: app_data[ATTR_SLUG],
+                ATTR_NAME: app_data[ATTR_NAME],
+                ATTR_VERSION: app_data[ATTR_VERSION],
+                ATTR_SIZE: app_data[ATTR_SIZE],
+            }
+            for app_data in backup.apps
+        ]
         return {
             ATTR_SLUG: backup.slug,
             ATTR_TYPE: backup.sys_type,
@@ -246,12 +234,70 @@ class APIBackups(CoreSysAttributes):
             ATTR_HOMEASSISTANT: backup.homeassistant_version,
             ATTR_LOCATION: backup.location,
             ATTR_LOCATIONS: backup.locations,
-            ATTR_ADDONS: data_addons,
+            ATTR_APPS: data_apps,
             ATTR_REPOSITORIES: backup.repositories,
             ATTR_FOLDERS: backup.folders,
             ATTR_HOMEASSISTANT_EXCLUDE_DATABASE: backup.homeassistant_exclude_database,
             ATTR_EXTRA: backup.extra,
         }
+
+    @api_process
+    async def list_backups(self, request: web.Request) -> dict[str, Any]:
+        """Return backup list (v2: content uses "apps" key)."""
+        return {ATTR_BACKUPS: self._list_backups()}
+
+    @api_process
+    async def list_backups_v1(self, request: web.Request) -> dict[str, Any]:
+        """Return backup list (v1: content uses "addons" key)."""
+        return {
+            ATTR_BACKUPS: self._rename_apps_to_addons_in_backups(self._list_backups())
+        }
+
+    @api_process
+    async def info(self, request: web.Request) -> dict[str, Any]:
+        """Return backup list and manager info (v2: content uses "apps" key)."""
+        return {
+            ATTR_BACKUPS: self._list_backups(),
+            ATTR_DAYS_UNTIL_STALE: self.sys_backups.days_until_stale,
+        }
+
+    @api_process
+    async def info_v1(self, request: web.Request) -> dict[str, Any]:
+        """Return backup list and manager info (v1: content uses "addons" key)."""
+        return {
+            ATTR_BACKUPS: self._rename_apps_to_addons_in_backups(self._list_backups()),
+            ATTR_DAYS_UNTIL_STALE: self.sys_backups.days_until_stale,
+        }
+
+    @api_process
+    async def options(self, request):
+        """Set backup manager options."""
+        body = await api_validate(SCHEMA_OPTIONS, request)
+
+        if ATTR_DAYS_UNTIL_STALE in body:
+            self.sys_backups.days_until_stale = body[ATTR_DAYS_UNTIL_STALE]
+
+        await self.sys_backups.save_data()
+
+    @api_process
+    async def reload(self, _: web.Request) -> bool:
+        """Reload backup list."""
+        await asyncio.shield(self.sys_backups.reload())
+        return True
+
+    @api_process
+    async def backup_info(self, request: web.Request) -> dict[str, Any]:
+        """Return backup info (v2: top-level "apps" key)."""
+        backup = self._extract_slug(request)
+        return self._backup_info_data(backup)
+
+    @api_process
+    async def backup_info_v1(self, request: web.Request) -> dict[str, Any]:
+        """Return backup info (v1: top-level "addons" key)."""
+        backup = self._extract_slug(request)
+        data = self._backup_info_data(backup)
+        data[ATTR_ADDONS] = data.pop(ATTR_APPS)
+        return data
 
     def _location_to_mount(self, location: str | None) -> LOCATION_TYPE:
         """Convert a single location to a mount if possible."""
@@ -285,6 +331,20 @@ class APIBackups(CoreSysAttributes):
                 f"Location {LOCATION_CLOUD_BACKUP} is only available for Home Assistant"
             )
 
+    def _process_location_in_body(
+        self, request: web.Request, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Validate and convert location field in partial backup/restore body."""
+        if ATTR_LOCATION not in body:
+            return body
+        location_names: list[str | None] = body.pop(ATTR_LOCATION)
+        self._validate_cloud_backup_location(request, location_names)
+        locations = [self._location_to_mount(loc) for loc in location_names]
+        body[ATTR_LOCATION] = locations.pop(0)
+        if locations:
+            body[ATTR_ADDITIONAL_LOCATIONS] = locations
+        return body
+
     @api_process
     async def backup_full(self, request: web.Request):
         """Create full backup."""
@@ -310,7 +370,26 @@ class APIBackups(CoreSysAttributes):
         if background and not backup_task.done():
             return {ATTR_JOB_ID: job_id}
 
-        backup: Backup = await backup_task
+        backup: Backup | None = await backup_task
+        if backup:
+            return {ATTR_JOB_ID: job_id, ATTR_SLUG: backup.slug}
+        raise APIError(
+            f"An error occurred while making backup, check job '{job_id}' or supervisor logs for details",
+            job_id=job_id,
+        )
+
+    async def _do_backup_partial(
+        self, body: dict[str, Any], background: bool
+    ) -> dict[str, Any]:
+        """Run backup_partial business logic. Expects body["apps"] (v2 key)."""
+        backup_task, job_id = await background_task(
+            self, self.sys_backups.do_backup_partial, **body
+        )
+
+        if background and not backup_task.done():
+            return {ATTR_JOB_ID: job_id}
+
+        backup: Backup | None = await backup_task
         if backup:
             return {ATTR_JOB_ID: job_id, ATTR_SLUG: backup.slug}
         raise APIError(
@@ -320,39 +399,31 @@ class APIBackups(CoreSysAttributes):
 
     @api_process
     async def backup_partial(self, request: web.Request):
-        """Create a partial backup."""
+        """Create a partial backup (v2: accepts "apps" key in request body)."""
         body = await api_validate(SCHEMA_BACKUP_PARTIAL, request)
-        locations: list[LOCATION_TYPE] | None = None
+        self._process_location_in_body(request, body)
 
-        if ATTR_LOCATION in body:
-            location_names: list[str | None] = body.pop(ATTR_LOCATION)
-            self._validate_cloud_backup_location(request, location_names)
-
-            locations = [
-                self._location_to_mount(location) for location in location_names
-            ]
-            body[ATTR_LOCATION] = locations.pop(0)
-            if locations:
-                body[ATTR_ADDITIONAL_LOCATIONS] = locations
-
-        if body.get(ATTR_ADDONS) == ALL_ADDONS_FLAG:
-            body[ATTR_ADDONS] = list(self.sys_addons.local)
+        if body.get(ATTR_APPS) == ALL_APPS_FLAG:
+            body[ATTR_APPS] = list(self.sys_apps.local)
 
         background = body.pop(ATTR_BACKGROUND)
-        backup_task, job_id = await background_task(
-            self, self.sys_backups.do_backup_partial, **body
-        )
+        return await self._do_backup_partial(body, background)
 
-        if background and not backup_task.done():
-            return {ATTR_JOB_ID: job_id}
+    @api_process
+    async def backup_partial_v1(self, request: web.Request):
+        """Create a partial backup (v1: accepts "addons" key in request body)."""
+        body = await api_validate(SCHEMA_BACKUP_PARTIAL_V1, request)
+        self._process_location_in_body(request, body)
 
-        backup: Backup = await backup_task
-        if backup:
-            return {ATTR_JOB_ID: job_id, ATTR_SLUG: backup.slug}
-        raise APIError(
-            f"An error occurred while making backup, check job '{job_id}' or supervisor logs for details",
-            job_id=job_id,
-        )
+        if body.get(ATTR_ADDONS) == ALL_APPS_FLAG:
+            body[ATTR_ADDONS] = list(self.sys_apps.local)
+
+        # Rename "addons" → "apps" so _do_backup_partial receives the v2 key
+        if ATTR_ADDONS in body:
+            body[ATTR_APPS] = body.pop(ATTR_ADDONS)
+
+        background = body.pop(ATTR_BACKGROUND)
+        return await self._do_backup_partial(body, background)
 
     @api_process
     async def restore_full(self, request: web.Request):
@@ -374,15 +445,10 @@ class APIBackups(CoreSysAttributes):
             job_id=job_id,
         )
 
-    @api_process
-    async def restore_partial(self, request: web.Request):
-        """Partial restore a backup."""
-        backup = self._extract_slug(request)
-        body = await api_validate(SCHEMA_RESTORE_PARTIAL, request)
-        self._validate_cloud_backup_location(
-            request, body.get(ATTR_LOCATION, backup.location)
-        )
-        background = body.pop(ATTR_BACKGROUND)
+    async def _do_restore_partial(
+        self, backup: Backup, body: dict[str, Any], background: bool
+    ) -> dict[str, Any]:
+        """Run restore_partial business logic. Expects body["apps"] (v2 key)."""
         restore_task, job_id = await background_task(
             self, self.sys_backups.do_restore_partial, backup, **body
         )
@@ -393,6 +459,33 @@ class APIBackups(CoreSysAttributes):
             f"An error occurred during restore of {backup.slug}, check job '{job_id}' or supervisor logs for details",
             job_id=job_id,
         )
+
+    @api_process
+    async def restore_partial(self, request: web.Request):
+        """Partial restore a backup (v2: accepts "apps" key in request body)."""
+        backup = self._extract_slug(request)
+        body = await api_validate(SCHEMA_RESTORE_PARTIAL, request)
+        self._validate_cloud_backup_location(
+            request, body.get(ATTR_LOCATION, backup.location)
+        )
+        background = body.pop(ATTR_BACKGROUND)
+        return await self._do_restore_partial(backup, body, background)
+
+    @api_process
+    async def restore_partial_v1(self, request: web.Request):
+        """Partial restore a backup (v1: accepts "addons" key in request body)."""
+        backup = self._extract_slug(request)
+        body = await api_validate(SCHEMA_RESTORE_PARTIAL_V1, request)
+        self._validate_cloud_backup_location(
+            request, body.get(ATTR_LOCATION, backup.location)
+        )
+        background = body.pop(ATTR_BACKGROUND)
+
+        # Rename "addons" → "apps" so _do_restore_partial receives the v2 key
+        if ATTR_ADDONS in body:
+            body[ATTR_APPS] = body.pop(ATTR_ADDONS)
+
+        return await self._do_restore_partial(backup, body, background)
 
     @api_process
     async def freeze(self, request: web.Request):
@@ -421,7 +514,7 @@ class APIBackups(CoreSysAttributes):
         await self.sys_backups.remove(backup, locations=locations)
 
     @api_process
-    async def download(self, request: web.Request):
+    async def download(self, request: web.Request) -> web.StreamResponse:
         """Download a backup file."""
         backup = self._extract_slug(request)
         # Query will give us '' for /backups, convert value to None
@@ -451,7 +544,7 @@ class APIBackups(CoreSysAttributes):
         return response
 
     @api_process
-    async def upload(self, request: web.Request):
+    async def upload(self, request: web.Request) -> dict[str, str] | bool:
         """Upload a backup file."""
         location: LOCATION_TYPE = None
         locations: list[LOCATION_TYPE] | None = None
@@ -480,14 +573,14 @@ class APIBackups(CoreSysAttributes):
 
         tmp_path = await self.sys_backups.get_upload_path_for_location(location)
         temp_dir: TemporaryDirectory | None = None
-        backup_file_stream: IOBase | None = None
+        backup_file_stream: BufferedWriter | None = None
 
-        def open_backup_file() -> Path:
+        def open_backup_file() -> tuple[Path, BufferedWriter]:
             nonlocal temp_dir, backup_file_stream
             temp_dir = TemporaryDirectory(dir=tmp_path.as_posix())
             tar_file = Path(temp_dir.name, "upload.tar")
             backup_file_stream = tar_file.open("wb")
-            return tar_file
+            return (tar_file, backup_file_stream)
 
         def close_backup_file() -> None:
             if backup_file_stream:
@@ -503,12 +596,10 @@ class APIBackups(CoreSysAttributes):
             if not isinstance(contents, BodyPartReader):
                 raise APIError("Improperly formatted upload, could not read backup")
 
-            tar_file = await self.sys_run_in_executor(open_backup_file)
-            while chunk := await contents.read_chunk(size=2**16):
-                await self.sys_run_in_executor(
-                    cast(IOBase, backup_file_stream).write, chunk
-                )
-            await self.sys_run_in_executor(cast(IOBase, backup_file_stream).close)
+            tar_file, backup_writer = await self.sys_run_in_executor(open_backup_file)
+            while chunk := await contents.read_chunk(size=DEFAULT_CHUNK_SIZE):
+                await self.sys_run_in_executor(backup_writer.write, chunk)
+            await self.sys_run_in_executor(backup_writer.close)
 
             backup = await asyncio.shield(
                 self.sys_backups.import_backup(
@@ -519,13 +610,8 @@ class APIBackups(CoreSysAttributes):
                 )
             )
         except OSError as err:
-            if err.errno == errno.EBADMSG and location in {
-                LOCATION_CLOUD_BACKUP,
-                None,
-            }:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            if location in {LOCATION_CLOUD_BACKUP, None}:
+                self.sys_resolution.check_oserror(err)
             _LOGGER.error("Can't write new backup file: %s", err)
             return False
 

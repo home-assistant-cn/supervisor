@@ -5,11 +5,11 @@ from typing import Any
 
 import voluptuous as vol
 
-from ...addons.addon import Addon
-from ...exceptions import ServicesError
-from ...validate import network_port
+from ...apps.app import App
+from ...exceptions import ServiceAlreadyProvidedError, ServiceNotProvidedError
+from ...validate import migrate_addon_to_app, network_port
 from ..const import (
-    ATTR_ADDON,
+    ATTR_APP,
     ATTR_HOST,
     ATTR_PASSWORD,
     ATTR_PORT,
@@ -37,7 +37,10 @@ SCHEMA_SERVICE_MQTT = vol.Schema(
     }
 )
 
-SCHEMA_CONFIG_MQTT = SCHEMA_SERVICE_MQTT.extend({vol.Required(ATTR_ADDON): str})
+# 'addon' field deprecated as of 2026.05, replaced by 'app'
+SCHEMA_CONFIG_MQTT = vol.All(
+    migrate_addon_to_app, SCHEMA_SERVICE_MQTT.extend({vol.Required(ATTR_APP): str})
+)
 
 
 class MQTTService(ServiceInterface):
@@ -60,31 +63,30 @@ class MQTTService(ServiceInterface):
 
     @property
     def active(self) -> list[str]:
-        """Return list of addon slug they have enable that."""
+        """Return list of app slug they have enable that."""
         if not self.enabled:
             return []
-        return [self._data[ATTR_ADDON]]
+        return [self._data[ATTR_APP]]
 
-    async def set_service_data(self, addon: Addon, data: dict[str, Any]) -> None:
+    async def set_service_data(self, app: App, data: dict[str, Any]) -> None:
         """Write the data into service object."""
         if self.enabled:
-            raise ServicesError(
-                f"There is already a MQTT service in use from {self._data[ATTR_ADDON]}",
-                _LOGGER.error,
+            raise ServiceAlreadyProvidedError(
+                _LOGGER.debug,
+                service=SERVICE_MQTT,
+                app=self._data[ATTR_APP],
             )
 
         self._data.update(data)
-        self._data[ATTR_ADDON] = addon.slug
+        self._data[ATTR_APP] = app.slug
 
-        _LOGGER.info("Set %s as service provider for mqtt", addon.slug)
+        _LOGGER.info("Set %s as service provider for mqtt", app.slug)
         await self.save()
 
-    async def del_service_data(self, addon: Addon) -> None:
+    async def del_service_data(self, app: App) -> None:
         """Remove the data from service object."""
         if not self.enabled:
-            raise ServicesError(
-                "Can't remove nonexistent service data", _LOGGER.warning
-            )
+            raise ServiceNotProvidedError(_LOGGER.debug, service=SERVICE_MQTT)
 
         self._data.clear()
         await self.save()

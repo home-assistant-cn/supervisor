@@ -2,10 +2,8 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-import errno
 import logging
 from pathlib import Path, PurePath
-from typing import cast
 
 import aiohttp
 from awesomeversion import AwesomeVersion, AwesomeVersionException
@@ -16,6 +14,7 @@ from ..dbus.agent.boards.const import BOARD_NAME_SUPERVISED
 from ..dbus.rauc import RaucState, SlotStatusDataType
 from ..exceptions import (
     DBusError,
+    DBusNotConnectedError,
     HassOSJobError,
     HassOSSlotNotFound,
     HassOSSlotUpdateError,
@@ -23,8 +22,7 @@ from ..exceptions import (
 )
 from ..jobs.const import JobConcurrency, JobCondition
 from ..jobs.decorator import Job
-from ..resolution.const import UnhealthyReason
-from ..utils.sentry import async_capture_exception
+from ..resolution.const import ContextType, IssueType, SuggestionType
 from .data_disk import DataDisk
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -52,7 +50,7 @@ class SlotStatus:
     parent: str | None = None
 
     @classmethod
-    def from_dict(cls, data: SlotStatusDataType) -> "SlotStatus":
+    def from_dict(cls, data: SlotStatusDataType) -> SlotStatus:
         """Create SlotStatus from dictionary."""
         return cls(
             class_=data["class"],
@@ -61,8 +59,8 @@ class SlotStatus:
             device=PurePath(data["device"]),
             bundle_compatible=data.get("bundle.compatible"),
             sha256=data.get("sha256"),
-            size=cast(int | None, data.get("size")),
-            installed_count=cast(int | None, data.get("installed.count")),
+            size=data.get("size"),
+            installed_count=data.get("installed.count"),
             bundle_version=AwesomeVersion(data["bundle.version"])
             if "bundle.version" in data
             else None,
@@ -70,7 +68,7 @@ class SlotStatus:
             if "installed.timestamp" in data
             else None,
             status=data.get("status"),
-            activated_count=cast(int | None, data.get("activated.count")),
+            activated_count=data.get("activated.count"),
             activated_timestamp=datetime.fromisoformat(data["activated.timestamp"])
             if "activated.timestamp" in data
             else None,
@@ -91,6 +89,7 @@ class OSManager(CoreSysAttributes):
         self._datadisk: DataDisk = DataDisk(coresys)
         self._available: bool = False
         self._version: AwesomeVersion | None = None
+        self._version_pending: AwesomeVersion | None = None
         self._board: str | None = None
         self._os_name: str | None = None
         self._slots: dict[str, SlotStatus] | None = None
@@ -116,6 +115,11 @@ class OSManager(CoreSysAttributes):
         return self.sys_updater.version_hassos_unrestricted
 
     @property
+    def version_pending(self) -> AwesomeVersion | None:
+        """Return version of an installed update that awaits a reboot to activate."""
+        return self._version_pending
+
+    @property
     def need_update(self) -> bool:
         """Return true if a HassOS update is available."""
         try:
@@ -123,8 +127,12 @@ class OSManager(CoreSysAttributes):
                 self.version is not None
                 and self.latest_version is not None
                 and self.version < self.latest_version
+                and (
+                    self.version_pending is None
+                    or self.latest_version != self.version_pending
+                )
             )
-        except (AwesomeVersionException, TypeError):
+        except AwesomeVersionException, TypeError:
             return False
 
     @property
@@ -152,12 +160,12 @@ class OSManager(CoreSysAttributes):
     def get_slot_name(self, boot_name: str) -> str:
         """Get slot name from boot name."""
         if not self._slots:
-            raise HassOSSlotNotFound()
+            raise HassOSSlotNotFound
 
         for name, status in self._slots.items():
             if status.bootname == boot_name:
                 return name
-        raise HassOSSlotNotFound()
+        raise HassOSSlotNotFound
 
     def _get_download_url(self, version: AwesomeVersion) -> str:
         raw_url = self.sys_updater.ota_url
@@ -177,10 +185,9 @@ class OSManager(CoreSysAttributes):
         else:
             update_os_name = "haos"
 
-        url = raw_url.format(
+        return raw_url.format(
             version=str(version), board=update_board, os_name=update_os_name
         )
-        return url
 
     async def _download_raucb(self, url: str, raucb: Path) -> None:
         """Download rauc bundle (OTA) from URL."""
@@ -208,16 +215,15 @@ class OSManager(CoreSysAttributes):
             _LOGGER.info("Completed download of OTA update file %s", raucb)
 
         except (aiohttp.ClientError, TimeoutError) as err:
-            self.sys_supervisor.connectivity = False
+            # Nudge a fresh connectivity check; the probe is authoritative,
+            # this error path only hints that something may be wrong.
+            self.sys_supervisor.request_connectivity_check()
             raise HassOSUpdateError(
                 f"Can't fetch OTA update from {url}: {err!s}", _LOGGER.error
             ) from err
 
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             raise HassOSUpdateError(
                 f"Can't write OTA file: {err!s}", _LOGGER.error
             ) from err
@@ -234,13 +240,13 @@ class OSManager(CoreSysAttributes):
         """Load HassOS data."""
         try:
             if not self.sys_host.info.cpe:
-                raise NotImplementedError()
+                raise NotImplementedError
 
             cpe = CPE(self.sys_host.info.cpe)
             os_name = cpe.get_product()[0]
             if os_name not in ("hassos", "haos"):
                 self._board = BOARD_NAME_SUPERVISED.lower()
-                raise NotImplementedError()
+                raise NotImplementedError
         except NotImplementedError:
             _LOGGER.info("No Home Assistant Operating System found")
             return
@@ -262,6 +268,51 @@ class OSManager(CoreSysAttributes):
             self.sys_dbus.rauc.boot_slot,
         )
 
+    async def _detect_pending_update(self) -> None:
+        """Detect an installed update that still requires a reboot to activate.
+
+        A successful rauc install makes the target slot the primary boot slot
+        while the old version keeps running until reboot. Supervisor may
+        restart in that window, so recover the pending state from rauc.
+
+        Must run after the booted slot was marked good: rauc's GRUB backend
+        only treats a slot as primary once it has no boot attempts pending,
+        so until the boot attempt counter of the booted slot is reset,
+        GetPrimary reports the previous slot as primary on every boot.
+        """
+        try:
+            primary = await self.sys_dbus.rauc.get_primary()
+        except DBusError, DBusNotConnectedError:
+            _LOGGER.warning("Can't get primary boot slot from rauc")
+            return
+
+        if (
+            not self._slots
+            or (status := self._slots.get(primary)) is None
+            or not status.bundle_version
+            or not status.bootname
+        ):
+            return
+
+        # Nothing pending if the primary slot is the booted one or holds
+        # the same version as the running system
+        if (
+            status.bootname == self.sys_dbus.rauc.boot_slot
+            or status.bundle_version == self.version
+        ):
+            return
+
+        self._version_pending = status.bundle_version
+        _LOGGER.info(
+            "Home Assistant Operating System %s is installed and pending a reboot to activate",
+            status.bundle_version,
+        )
+        self.sys_resolution.create_issue(
+            IssueType.REBOOT_REQUIRED,
+            ContextType.SYSTEM,
+            suggestions=[SuggestionType.EXECUTE_REBOOT],
+        )
+
     @Job(
         name="os_manager_config_sync",
         conditions=[JobCondition.HAOS],
@@ -272,7 +323,14 @@ class OSManager(CoreSysAttributes):
         _LOGGER.info(
             "Synchronizing configuration from USB with Home Assistant Operating System."
         )
-        await self.sys_host.services.restart("hassos-config.service")
+        # hassos-config.service was renamed to haos-config.service in HAOS 18.0.
+        # The unit's Alias= is not reported by systemd's ListUnits, which
+        # ServiceManager.exists() relies on, so call the correct unit here.
+        if self.version is not None and self.version >= AwesomeVersion("18.0.rc1"):
+            service = "haos-config.service"
+        else:
+            service = "hassos-config.service"
+        await self.sys_host.services.restart(service)
 
     @Job(
         name="os_manager_update",
@@ -299,6 +357,11 @@ class OSManager(CoreSysAttributes):
             raise HassOSUpdateError(
                 f"Version {version!s} is already installed", _LOGGER.warning
             )
+        if self.version_pending is not None and version == self.version_pending:
+            raise HassOSUpdateError(
+                f"Version {version!s} is already installed, reboot the system to activate it",
+                _LOGGER.warning,
+            )
 
         # Fetch files from internet
         ota_url = self._get_download_url(version)
@@ -318,14 +381,20 @@ class OSManager(CoreSysAttributes):
             raise HassOSUpdateError("Rauc communication error", _LOGGER.error) from err
 
         finally:
-            int_ota.unlink()
+            await self.sys_run_in_executor(int_ota.unlink)
 
         # Update success
         if 0 in completed:
             _LOGGER.info(
-                "Install of Home Assistant Operating System %s success", version
+                "Install of Home Assistant Operating System %s success; reboot required",
+                version,
             )
-            self.sys_create_task(self.sys_host.control.reboot())
+            self._version_pending = version
+            self.sys_resolution.create_issue(
+                IssueType.REBOOT_REQUIRED,
+                ContextType.SYSTEM,
+                suggestions=[SuggestionType.EXECUTE_REBOOT],
+            )
             return
 
         # Update failed
@@ -334,26 +403,82 @@ class OSManager(CoreSysAttributes):
             "Home Assistant Operating System update failed with: %s",
             self.sys_dbus.rauc.last_error,
         )
-        raise HassOSUpdateError()
+        # The failed install overwrote the target slot, so a previously
+        # installed update pending activation is gone as well
+        self._version_pending = None
+        raise HassOSUpdateError
+
+    @Job(
+        name="os_manager_update_raspberrypi_firmware",
+        conditions=[JobCondition.HAOS],
+        on_condition=HassOSJobError,
+        concurrency=JobConcurrency.REJECT,
+    )
+    async def update_raspberrypi_firmware(self) -> None:
+        """Update Raspberry Pi firmware (and VL805 where present).
+
+        Always raises a REBOOT_REQUIRED issue on success — the running
+        bootloader is the old one until reboot, regardless of whether the
+        update was flashed live (BCM2712) or staged for next boot (BCM2711).
+        """
+        if not self.sys_dbus.agent.board.has_rpi_firmware:
+            raise HassOSJobError(
+                "Raspberry Pi firmware is not available on this board",
+                _LOGGER.error,
+            )
+
+        rpi = self.sys_dbus.agent.board.rpi_firmware
+        if rpi.update_blocked:
+            raise HassOSJobError(
+                "Raspberry Pi firmware update is unavailable on this boot device",
+                _LOGGER.warning,
+            )
+
+        try:
+            await rpi.update_firmware()
+        except DBusError as err:
+            raise HassOSJobError(
+                f"Raspberry Pi firmware update failed: {err}. "
+                "Check the Host logs for details.",
+                _LOGGER.error,
+            ) from err
+
+        _LOGGER.info("Raspberry Pi firmware update completed; reboot required")
+        self.sys_resolution.create_issue(
+            IssueType.REBOOT_REQUIRED,
+            ContextType.SYSTEM,
+            suggestions=[SuggestionType.EXECUTE_REBOOT],
+        )
 
     @Job(name="os_manager_mark_healthy", conditions=[JobCondition.HAOS], internal=True)
     async def mark_healthy(self) -> None:
         """Set booted partition as good for rauc."""
         try:
-            responses = [
-                await self.sys_dbus.rauc.mark(RaucState.ACTIVE, "booted"),
-                await self.sys_dbus.rauc.mark(RaucState.GOOD, "booted"),
-            ]
+            # Marking the booted slot good resets its boot attempt counter,
+            # which the pending update detection below relies on: rauc's GRUB
+            # backend only treats a slot as primary once it has no boot
+            # attempts pending.
+            response = await self.sys_dbus.rauc.mark(RaucState.GOOD, "booted")
         except DBusError:
             _LOGGER.exception("Can't mark booted partition as healthy!")
-        else:
-            _LOGGER.info(
-                "Rauc: slot %s - %s, %s",
-                self.sys_dbus.rauc.boot_slot,
-                responses[0][1],
-                responses[1][1],
-            )
-            await self.reload()
+            return
+        _LOGGER.info("Rauc: slot %s - %s", self.sys_dbus.rauc.boot_slot, response[1])
+
+        await self.reload()
+        await self._detect_pending_update()
+
+        try:
+            # Marking the booted slot as active makes it the primary boot
+            # slot again, which would cancel an installed update that still
+            # awaits a reboot to activate.
+            if not self.version_pending:
+                response = await self.sys_dbus.rauc.mark(RaucState.ACTIVE, "booted")
+                await self.reload()
+                _LOGGER.info(
+                    "Rauc: slot %s - %s", self.sys_dbus.rauc.boot_slot, response[1]
+                )
+        except DBusError:
+            _LOGGER.exception("Can't mark booted partition as active!")
 
     @Job(
         name="os_manager_set_boot_slot",
@@ -368,7 +493,6 @@ class OSManager(CoreSysAttributes):
                 RaucState.ACTIVE, self.get_slot_name(boot_name)
             )
         except DBusError as err:
-            await async_capture_exception(err)
             raise HassOSSlotUpdateError(
                 f"Can't mark {boot_name} as active!", _LOGGER.error
             ) from err

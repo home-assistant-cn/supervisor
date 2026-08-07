@@ -9,7 +9,7 @@ from contextvars import Context, ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime
 import logging
-from typing import Any, Self
+from typing import Any, Self, cast
 from uuid import uuid4
 
 from attr.validators import gt, lt
@@ -17,7 +17,7 @@ from attrs import Attribute, define, field
 from attrs.setters import convert as attr_convert, frozen, validate as attr_validate
 from attrs.validators import ge, le
 
-from ..const import BusEvent
+from ..const import BusEvent, FeatureFlag
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HassioError, JobNotFound, JobStartException
 from ..homeassistant.const import WSEvent
@@ -34,6 +34,43 @@ from .validate import SCHEMA_JOBS_CONFIG
 _CURRENT_JOB: ContextVar[str | None] = ContextVar("current_job", default=None)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+LEGACY_BACKUP_RESTORE_STAGE_MAP: dict[str, str] = {
+    "app_repositories": "addon_repositories",
+    "apps": "addons",
+    "await_app_restarts": "await_addon_restarts",
+    "remove_delta_apps": "remove_delta_addons",
+}
+
+BACKUP_RESTORE_JOB_NAMES: set[str] = {
+    "backup_manager_full_restore",
+    "backup_manager_partial_restore",
+    "backup_manager_full_backup",
+    "backup_manager_partial_backup",
+}
+
+
+def process_job_dict_for_legacy_compatibility(
+    job_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Map new job names to legacy names for API compatibility."""
+    # Home Assistant Core's hassio integration listens for this specific job name
+    # via the Supervisor websocket API. Core v2026.8 supports both names, so this
+    # compatibility can be removed when Core v2026.7 is no longer supported.
+    if job_data.get("name") == "app_manager_update":
+        return job_data | {"name": "addon_manager_update"}
+
+    # Home Assistant Core expects legacy backup/restore stage names on websocket
+    # v1 and REST v1. Map only backup manager jobs to avoid changing unrelated
+    # stage names.
+    if (
+        job_data.get("name") in BACKUP_RESTORE_JOB_NAMES
+        and (stage := cast(str | None, job_data.get("stage")))
+        in LEGACY_BACKUP_RESTORE_STAGE_MAP
+    ):
+        return job_data | {"stage": LEGACY_BACKUP_RESTORE_STAGE_MAP[stage]}
+
+    return job_data
 
 
 @dataclass
@@ -98,17 +135,19 @@ class SupervisorJobError:
     """Representation of an error occurring during a supervisor job."""
 
     type_: type[HassioError] = HassioError
-    message: str = (
-        "Unknown error, see Supervisor logs (check with 'ha supervisor logs')"
-    )
+    message: str = "Unknown error, see Supervisor logs"
     stage: str | None = None
+    error_key: str | None = None
+    extra_fields: dict[str, Any] | None = None
 
-    def as_dict(self) -> dict[str, str | None]:
+    def as_dict(self) -> dict[str, Any]:
         """Return dictionary representation."""
         return {
             "type": self.type_.__name__,
             "message": self.message,
             "stage": self.stage,
+            "error_key": self.error_key,
+            "extra_fields": self.extra_fields,
         }
 
 
@@ -139,6 +178,20 @@ class SupervisorJob:
     extra: dict[str, Any] | None = None
     child_job_syncs: list[ChildJobSyncFilter] | None = None
     parent_job_syncs: list[ParentJobSync] = field(init=False, factory=list)
+    _child_sync_baselines: dict[ChildJobSyncFilter, float] = field(
+        init=False, factory=dict
+    )
+
+    def register_child_sync(self, sync: ChildJobSyncFilter) -> float:
+        """Return the progress baseline a child sync owns on this job.
+
+        The first child to match a sync captures this job's current progress as
+        the baseline of the sync's allocation band. Children matching the same
+        sync afterwards (e.g. a docker image pull retried after a failure) reuse
+        that baseline so they restart the band instead of stacking progress on
+        top of the previous attempt.
+        """
+        return self._child_sync_baselines.setdefault(sync, self.progress)
 
     def as_dict(self) -> dict[str, Any]:
         """Return dictionary representation."""
@@ -158,7 +211,9 @@ class SupervisorJob:
     def capture_error(self, err: HassioError | None = None) -> None:
         """Capture an error or record that an unknown error has occurred."""
         if err:
-            new_error = SupervisorJobError(type(err), str(err), self.stage)
+            new_error = SupervisorJobError(
+                type(err), str(err), self.stage, err.error_key, err.extra_fields
+            )
         else:
             new_error = SupervisorJobError(stage=self.stage)
         self.errors += [new_error]
@@ -196,7 +251,7 @@ class SupervisorJob:
         self,
         progress: float | None = None,
         stage: str | None = None,
-        extra: dict[str, Any] | None = DEFAULT,  # type: ignore
+        extra: dict[str, Any] | None | type[DEFAULT] = DEFAULT,
         done: bool | None = None,
     ) -> None:
         """Update multiple fields with one on change event."""
@@ -207,8 +262,8 @@ class SupervisorJob:
             self.progress = progress
         if stage is not None:
             self.stage = stage
-        if extra != DEFAULT:
-            self.extra = extra
+        if extra is not DEFAULT:
+            self.extra = cast(dict[str, Any] | None, extra)
 
         # Done has special event. use that to trigger on change if included
         # If not then just use any other field to trigger
@@ -238,7 +293,7 @@ class JobManager(FileConfiguration, CoreSysAttributes):
 
     @property
     def ignore_conditions(self) -> list[JobCondition]:
-        """Return a list of ingore condition."""
+        """Return a list of ignore conditions."""
         return self._data[ATTR_IGNORE_CONDITIONS]
 
     @ignore_conditions.setter
@@ -270,6 +325,10 @@ class JobManager(FileConfiguration, CoreSysAttributes):
         if attribute.name == "errors":
             value = [err.as_dict() for err in value]
         job_data = job.as_dict() | {attribute.name: value}
+        if not self.sys_config.feature_flags.get(
+            FeatureFlag.SUPERVISOR_WEBSOCKET_V2_API, False
+        ):
+            job_data = process_job_dict_for_legacy_compatibility(job_data)
 
         # Notify Home Assistant of change if its not internal
         if not job.internal:
@@ -306,19 +365,21 @@ class JobManager(FileConfiguration, CoreSysAttributes):
         reference: str | None = None,
         initial_stage: str | None = None,
         internal: bool = False,
-        parent_id: str | None = DEFAULT,  # type: ignore
+        parent_id: str | None | type[DEFAULT] = DEFAULT,
         child_job_syncs: list[ChildJobSyncFilter] | None = None,
     ) -> SupervisorJob:
         """Create a new job."""
-        job = SupervisorJob(
-            name,
-            reference=reference,
-            stage=initial_stage,
-            on_change=self._on_job_change,
-            internal=internal,
-            child_job_syncs=child_job_syncs,
-            **({} if parent_id == DEFAULT else {"parent_id": parent_id}),  # type: ignore
-        )
+        kwargs: dict[str, Any] = {
+            "reference": reference,
+            "stage": initial_stage,
+            "on_change": self._on_job_change,
+            "internal": internal,
+            "child_job_syncs": child_job_syncs,
+        }
+        if parent_id is not DEFAULT:
+            kwargs["parent_id"] = parent_id
+
+        job = SupervisorJob(name, **kwargs)
 
         # Shouldn't happen but inability to find a parent for progress reporting
         # shouldn't raise and break the active job
@@ -329,11 +390,8 @@ class JobManager(FileConfiguration, CoreSysAttributes):
                 if not curr_parent.child_job_syncs:
                     continue
 
-                # HACK: If parent trigger the same child job, we just skip this second
-                # sync. Maybe it would be better to have this reflected in the job stage
-                # and reset progress to 0 instead? There is no support for such stage
-                # information on Core update entities today though.
-                if curr_parent.done is True or curr_parent.progress >= 100:
+                # A finished parent can no longer take progress updates
+                if curr_parent.done is True:
                     _LOGGER.debug(
                         "Skipping parent job sync for done parent job %s",
                         curr_parent.name,
@@ -343,15 +401,28 @@ class JobManager(FileConfiguration, CoreSysAttributes):
                 # Break after first match at each parent as it doesn't make sense
                 # to match twice. But it could match multiple parents
                 for sync in curr_parent.child_job_syncs:
-                    if sync.matches(job):
-                        job.parent_job_syncs.append(
-                            ParentJobSync(
-                                curr_parent.uuid,
-                                starting_progress=curr_parent.progress,
-                                progress_allocation=sync.progress_allocation,
-                            )
-                        )
+                    if not sync.matches(job):
+                        continue
+
+                    # Reset the parent to the baseline this sync owns so a
+                    # re-triggered child (e.g. an image pull retried after a
+                    # failure) restarts its allocation band instead of stacking
+                    # on top of the previous attempt's progress.
+                    baseline = curr_parent.register_child_sync(sync)
+                    if baseline >= 100:
                         break
+                    # Guard avoids triggering a redundant on change when unchanged
+                    # pylint: disable-next=R1730
+                    if curr_parent.progress > baseline:  # noqa: PLR1730
+                        curr_parent.progress = baseline
+                    job.parent_job_syncs.append(
+                        ParentJobSync(
+                            curr_parent.uuid,
+                            starting_progress=baseline,
+                            progress_allocation=sync.progress_allocation,
+                        )
+                    )
+                    break
 
         self._jobs[job.uuid] = job
         return job

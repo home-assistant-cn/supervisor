@@ -1,9 +1,8 @@
 """Home Assistant control object."""
 
+import asyncio
 from collections.abc import Awaitable
 from contextlib import suppress
-from datetime import timedelta
-import errno
 from ipaddress import IPv4Address
 import logging
 from pathlib import Path
@@ -12,8 +11,6 @@ from tempfile import TemporaryDirectory
 import aiohttp
 from aiohttp.client_exceptions import ClientError
 from awesomeversion import AwesomeVersion, AwesomeVersionException
-
-from supervisor.jobs import ChildJobSyncFilter
 
 from .const import (
     ATTR_SUPERVISOR_INTERNET,
@@ -28,24 +25,23 @@ from .exceptions import (
     DockerError,
     HostAppArmorError,
     SupervisorAppArmorError,
-    SupervisorError,
     SupervisorJobError,
+    SupervisorUnknownError,
     SupervisorUpdateError,
 )
-from .jobs.const import JobCondition, JobThrottle
+from .jobs import ChildJobSyncFilter
+from .jobs.const import JobCondition
 from .jobs.decorator import Job
-from .resolution.const import ContextType, IssueType, UnhealthyReason
+from .resolution.const import ContextType, IssueType
 from .utils.sentry import async_capture_exception
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-
-def _check_connectivity_throttle_period(coresys: CoreSys, *_) -> timedelta:
-    """Throttle period for connectivity check."""
-    if coresys.supervisor.connectivity:
-        return timedelta(minutes=10)
-
-    return timedelta(seconds=5)
+# Minimum time between two actual connectivity probes. Callers within this
+# window get the cached result instead of hitting checkonline.home-assistant.io
+# again. The interval shrinks while we're offline so recovery is quick.
+_CONNECTIVITY_MIN_INTERVAL_CONNECTED_SEC: float = 600.0
+_CONNECTIVITY_MIN_INTERVAL_DISCONNECTED_SEC: float = 5.0
 
 
 class Supervisor(CoreSysAttributes):
@@ -56,6 +52,11 @@ class Supervisor(CoreSysAttributes):
         self.coresys: CoreSys = coresys
         self.instance: DockerSupervisor = DockerSupervisor(coresys)
         self._connectivity: bool = True
+        self._connectivity_check: asyncio.Task[None] | None = None
+        self._connectivity_rerun_forced: bool = False
+        # -inf means "never probed" so the first non-forced call always runs;
+        # 0.0 would wrongly short-circuit while loop.time() < min_interval.
+        self._connectivity_last_check: float = float("-inf")
 
     async def load(self) -> None:
         """Prepare Supervisor object."""
@@ -72,11 +73,19 @@ class Supervisor(CoreSysAttributes):
         """Return true if we are connected to the internet."""
         return self._connectivity
 
-    @connectivity.setter
-    def connectivity(self, state: bool) -> None:
-        """Set supervisor connectivity state."""
+    def _update_connectivity(self, state: bool) -> None:
+        """Update the cached connectivity state and notify listeners if it changed.
+
+        Only :meth:`check_and_update_connectivity` (or the task it spawns)
+        should ever call this. Bypass paths that set the state from outside
+        an actual probe make it impossible to reason about what the flag
+        means.
+        """
         if self._connectivity == state:
             return
+        _LOGGER.debug(
+            "Supervisor connectivity changed: %s -> %s", self._connectivity, state
+        )
         self._connectivity = state
         self.sys_bus.fire_event(BusEvent.SUPERVISOR_CONNECTIVITY_CHANGE, state)
         self.sys_homeassistant.websocket.supervisor_update_event(
@@ -96,7 +105,7 @@ class Supervisor(CoreSysAttributes):
 
         try:
             return self.version < self.latest_version
-        except (AwesomeVersionException, TypeError):
+        except AwesomeVersionException, TypeError:
             return False
 
     @property
@@ -141,7 +150,9 @@ class Supervisor(CoreSysAttributes):
                 data = await request.text()
 
         except (aiohttp.ClientError, TimeoutError) as err:
-            self.sys_supervisor.connectivity = False
+            # Nudge a fresh connectivity check; the probe is authoritative,
+            # this error path only hints that something may be wrong.
+            self.request_connectivity_check()
             raise SupervisorAppArmorError(
                 f"Can't fetch AppArmor profile {url}: {str(err) or 'Timeout'}",
                 _LOGGER.error,
@@ -163,10 +174,7 @@ class Supervisor(CoreSysAttributes):
             await self.sys_host.apparmor.load_profile("hassio-supervisor", profile_file)
 
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             raise SupervisorAppArmorError(
                 f"Can't write temporary profile: {err!s}", _LOGGER.error
             ) from err
@@ -242,14 +250,20 @@ class Supervisor(CoreSysAttributes):
     async def restart(self) -> None:
         """Restart Supervisor soft."""
         self.sys_core.exit_code = 100
-        self.sys_create_task(self.sys_core.stop())
+        stopping = asyncio.Event()
+        self.sys_create_task(self.sys_core.stop(stopping_complete=stopping))
+
+        # Return only once STOPPING is entered and new API requests are
+        # rejected, so a request sent after the restart response can no
+        # longer be accepted and then killed by the API teardown
+        await stopping.wait()
 
     @property
     def in_progress(self) -> bool:
         """Return True if a task is in progress."""
         return self.instance.in_progress
 
-    def logs(self) -> Awaitable[bytes]:
+    def logs(self) -> Awaitable[list[str]]:
         """Get Supervisor docker logs.
 
         Return Coroutine.
@@ -261,7 +275,7 @@ class Supervisor(CoreSysAttributes):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise SupervisorError() from err
+            raise SupervisorUnknownError from err
 
     async def repair(self):
         """Repair local Supervisor data."""
@@ -274,13 +288,92 @@ class Supervisor(CoreSysAttributes):
         except DockerError:
             _LOGGER.error("Repair of Supervisor failed")
 
-    @Job(
-        name="supervisor_check_connectivity",
-        throttle_period=_check_connectivity_throttle_period,
-        throttle=JobThrottle.THROTTLE,
-    )
-    async def check_connectivity(self) -> None:
-        """Check the Internet connectivity from Supervisor's point of view."""
+    def request_connectivity_check(self, *, force: bool = False) -> None:
+        """Schedule a connectivity check without awaiting the result.
+
+        Intended for signal handlers (D-Bus, plugin callbacks) that must
+        return quickly. Concurrent calls coalesce onto a single in-flight
+        check. ``force`` is forwarded to :meth:`check_and_update_connectivity`
+        for signals that carry fresh state-change information.
+        """
+        _LOGGER.debug("Connectivity check requested (force=%s)", force)
+        self.sys_create_task(self.check_and_update_connectivity(force=force))
+
+    async def check_and_update_connectivity(self, *, force: bool = False) -> None:
+        """Probe Supervisor internet connectivity and update cached state.
+
+        Concurrent callers coalesce onto a single HTTP probe: callers that
+        arrive while one is in flight await its completion rather than
+        starting a second.
+
+        Without ``force``, a probe that ran within the minimum interval
+        short-circuits and the cached state is returned. With ``force``, the
+        interval is bypassed and (if a probe is already in flight) a fresh
+        one is guaranteed to run once the current probe completes.
+        """
+        if self._connectivity_check is not None:
+            # Probe already in flight - coalesce with it. If the caller
+            # needs a fresh result, mark a trailing rerun so the task that
+            # owns the in-flight probe runs once more after it completes.
+            # Shield so a follower being cancelled cannot bring down the
+            # probe that other callers are also waiting on.
+            if force:
+                _LOGGER.debug(
+                    "Connectivity probe in flight; queued forced rerun on completion"
+                )
+                self._connectivity_rerun_forced = True
+            else:
+                _LOGGER.debug("Connectivity probe in flight; awaiting its result")
+            await asyncio.shield(self._connectivity_check)
+            return
+
+        if not force:
+            min_interval = (
+                _CONNECTIVITY_MIN_INTERVAL_CONNECTED_SEC
+                if self._connectivity
+                else _CONNECTIVITY_MIN_INTERVAL_DISCONNECTED_SEC
+            )
+            elapsed = self.sys_loop.time() - self._connectivity_last_check
+            if elapsed < min_interval:
+                _LOGGER.debug(
+                    "Connectivity check within min-interval (%.1fs of %.1fs); "
+                    "using cached state %s",
+                    elapsed,
+                    min_interval,
+                    self._connectivity,
+                )
+                return
+
+        # Awaiting a Task does not propagate cancellation INTO the task, so
+        # the owner explicitly cancels the probe on its own cancellation.
+        # That keeps the probe from being orphaned (with the next caller
+        # starting a second probe alongside the unfinished first).
+        probe = self.sys_create_task(self._do_connectivity_check())
+        self._connectivity_check = probe
+        try:
+            await probe
+        except asyncio.CancelledError:
+            _LOGGER.debug("Connectivity probe owner cancelled; cancelling probe")
+            probe.cancel()
+            with suppress(asyncio.CancelledError):
+                await probe
+            raise
+        finally:
+            if self._connectivity_check is probe:
+                self._connectivity_check = None
+
+        # Only count as a recent probe on actual completion. On cancellation
+        # the timestamp must stay so the next caller doesn't see a "fresh"
+        # cached result that never actually ran.
+        self._connectivity_last_check = self.sys_loop.time()
+
+        if self._connectivity_rerun_forced:
+            _LOGGER.debug("Running queued forced rerun after probe completion")
+            self._connectivity_rerun_forced = False
+            await self.check_and_update_connectivity(force=True)
+
+    async def _do_connectivity_check(self) -> None:
+        """Run a single HTTP probe and update cached connectivity state."""
         timeout = aiohttp.ClientTimeout(total=10)
         try:
             await self.sys_websession.head(
@@ -288,7 +381,7 @@ class Supervisor(CoreSysAttributes):
             )
         except (ClientError, TimeoutError) as err:
             _LOGGER.debug("Supervisor Connectivity check failed: %s", err)
-            self.connectivity = False
+            self._update_connectivity(False)
         else:
             _LOGGER.debug("Supervisor Connectivity check succeeded")
-            self.connectivity = True
+            self._update_connectivity(True)

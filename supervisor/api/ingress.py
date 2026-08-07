@@ -1,4 +1,4 @@
-"""Supervisor Add-on ingress service."""
+"""Supervisor App ingress service."""
 
 import asyncio
 from ipaddress import ip_address
@@ -15,7 +15,7 @@ from aiohttp.web_exceptions import (
 from multidict import CIMultiDict, istr
 import voluptuous as vol
 
-from ..addons.addon import Addon
+from ..apps.app import App
 from ..const import (
     ATTR_ADMIN,
     ATTR_ENABLE,
@@ -29,8 +29,8 @@ from ..const import (
     HEADER_REMOTE_USER_NAME,
     HEADER_TOKEN,
     HEADER_TOKEN_OLD,
+    HomeAssistantUser,
     IngressSessionData,
-    IngressSessionDataUser,
 )
 from ..coresys import CoreSysAttributes
 from ..exceptions import HomeAssistantAPIError
@@ -38,6 +38,8 @@ from .const import COOKIE_INGRESS
 from .utils import api_process, api_validate, require_home_assistant
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+MAX_WEBSOCKET_MESSAGE_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 VALIDATE_SESSION_DATA = vol.Schema({ATTR_SESSION: str})
 
@@ -73,43 +75,37 @@ def status_code_must_be_empty_body(code: int) -> bool:
 
 
 class APIIngress(CoreSysAttributes):
-    """Ingress view to handle add-on webui routing."""
+    """Ingress view to handle app webui routing."""
 
-    _list_of_users: list[IngressSessionDataUser]
-
-    def __init__(self) -> None:
-        """Initialize APIIngress."""
-        self._list_of_users = []
-
-    def _extract_addon(self, request: web.Request) -> Addon:
-        """Return addon, throw an exception it it doesn't exist."""
+    def _extract_app(self, request: web.Request) -> App:
+        """Return app, throw an exception it it doesn't exist."""
         token = request.match_info["token"]
 
-        # Find correct add-on
-        addon = self.sys_ingress.get(token)
-        if not addon:
+        # Find correct app
+        app = self.sys_ingress.get(token)
+        if not app:
             _LOGGER.warning("Ingress for %s not available", token)
-            raise HTTPServiceUnavailable()
+            raise HTTPServiceUnavailable
 
-        return addon
+        return app
 
-    def _create_url(self, addon: Addon, path: str) -> str:
+    def _create_url(self, app: App, path: str) -> str:
         """Create URL to container."""
-        return f"http://{addon.ip_address}:{addon.ingress_port}/{path}"
+        return f"http://{app.ip_address}:{app.ingress_port}/{path}"
 
     @api_process
     async def panels(self, request: web.Request) -> dict[str, Any]:
         """Create a list of panel data."""
-        addons = {}
-        for addon in self.sys_ingress.addons:
-            addons[addon.slug] = {
-                ATTR_TITLE: addon.panel_title,
-                ATTR_ICON: addon.panel_icon,
-                ATTR_ADMIN: addon.panel_admin,
-                ATTR_ENABLE: addon.ingress_panel,
+        apps = {}
+        for app in self.sys_ingress.apps:
+            apps[app.slug] = {
+                ATTR_TITLE: app.panel_title,
+                ATTR_ICON: app.panel_icon,
+                ATTR_ADMIN: app.panel_admin,
+                ATTR_ENABLE: app.ingress_panel,
             }
 
-        return {ATTR_PANELS: addons}
+        return {ATTR_PANELS: apps}
 
     @api_process
     @require_home_assistant
@@ -139,7 +135,7 @@ class APIIngress(CoreSysAttributes):
         # Check Ingress Session
         if not self.sys_ingress.validate_session(data[ATTR_SESSION]):
             _LOGGER.warning("No valid ingress session %s", data[ATTR_SESSION])
-            raise HTTPUnauthorized()
+            raise HTTPUnauthorized
 
     async def handler(
         self, request: web.Request
@@ -150,29 +146,29 @@ class APIIngress(CoreSysAttributes):
         session = request.cookies.get(COOKIE_INGRESS, "")
         if not self.sys_ingress.validate_session(session):
             _LOGGER.warning("No valid ingress session %s", session)
-            raise HTTPUnauthorized()
+            raise HTTPUnauthorized
 
         # Process requests
-        addon = self._extract_addon(request)
+        app = self._extract_app(request)
         path = request.match_info.get("path", "")
         session_data = self.sys_ingress.get_session_data(session)
         try:
             # Websocket
             if _is_websocket(request):
-                return await self._handle_websocket(request, addon, path, session_data)
+                return await self._handle_websocket(request, app, path, session_data)
 
             # Request
-            return await self._handle_request(request, addon, path, session_data)
+            return await self._handle_request(request, app, path, session_data)
 
         except aiohttp.ClientError as err:
             _LOGGER.error("Ingress error: %s", err)
 
-        raise HTTPBadGateway()
+        raise HTTPBadGateway
 
     async def _handle_websocket(
         self,
         request: web.Request,
-        addon: Addon,
+        app: App,
         path: str,
         session_data: IngressSessionData | None,
     ) -> web.WebSocketResponse:
@@ -186,13 +182,16 @@ class APIIngress(CoreSysAttributes):
             req_protocols = []
 
         ws_server = web.WebSocketResponse(
-            protocols=req_protocols, autoclose=False, autoping=False
+            protocols=req_protocols,
+            autoclose=False,
+            autoping=False,
+            max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
         )
         await ws_server.prepare(request)
 
         # Preparing
-        url = self._create_url(addon, path)
-        source_header = _init_header(request, addon, session_data)
+        url = self._create_url(app, path)
+        source_header = _init_header(request, app, session_data)
 
         # Support GET query
         if request.query_string:
@@ -200,13 +199,14 @@ class APIIngress(CoreSysAttributes):
 
         # Start proxy
         try:
-            _LOGGER.debug("Proxing WebSocket to %s, upstream url: %s", addon.slug, url)
+            _LOGGER.debug("Proxing WebSocket to %s, upstream url: %s", app.slug, url)
             async with self.sys_websession.ws_connect(
                 url,
                 headers=source_header,
                 protocols=req_protocols,
                 autoclose=False,
                 autoping=False,
+                max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
             ) as ws_client:
                 # Proxy requests
                 await asyncio.wait(
@@ -217,28 +217,28 @@ class APIIngress(CoreSysAttributes):
                     return_when=asyncio.FIRST_COMPLETED,
                 )
         except TimeoutError:
-            _LOGGER.warning("WebSocket proxy to %s timed out", addon.slug)
+            _LOGGER.warning("WebSocket proxy to %s timed out", app.slug)
 
         return ws_server
 
     async def _handle_request(
         self,
         request: web.Request,
-        addon: Addon,
+        app: App,
         path: str,
         session_data: IngressSessionData | None,
     ) -> web.Response | web.StreamResponse:
         """Ingress route for request."""
-        url = self._create_url(addon, path)
-        source_header = _init_header(request, addon, session_data)
+        url = self._create_url(app, path)
+        source_header = _init_header(request, app, session_data)
 
         # Passing the raw stream breaks requests for some webservers
         # since we just need it for POST requests really, for all other methods
-        # we read the bytes and pass that to the request to the add-on
-        # add-ons needs to add support with that in the configuration
+        # we read the bytes and pass that to the request to the app
+        # apps needs to add support with that in the configuration
         data = (
             request.content
-            if request.method == "POST" and addon.ingress_stream
+            if request.method == "POST" and app.ingress_stream
             else await request.read()
         )
 
@@ -306,24 +306,19 @@ class APIIngress(CoreSysAttributes):
 
             return response
 
-    async def _find_user_by_id(self, user_id: str) -> IngressSessionDataUser | None:
+    async def _find_user_by_id(self, user_id: str) -> HomeAssistantUser | None:
         """Find user object by the user's ID."""
         try:
-            list_of_users = await self.sys_homeassistant.get_users()
-        except (HomeAssistantAPIError, TypeError) as err:
-            _LOGGER.error(
-                "%s error occurred while requesting list of users: %s", type(err), err
-            )
+            users = await self.sys_homeassistant.list_users()
+        except HomeAssistantAPIError as err:
+            _LOGGER.warning("Could not fetch list of users: %s", err)
             return None
 
-        if list_of_users is not None:
-            self._list_of_users = list_of_users
-
-        return next((user for user in self._list_of_users if user.id == user_id), None)
+        return next((user for user in users if user.id == user_id), None)
 
 
 def _init_header(
-    request: web.Request, addon: Addon, session_data: IngressSessionData | None
+    request: web.Request, app: App, session_data: IngressSessionData | None
 ) -> CIMultiDict[str]:
     """Create initial header."""
     headers = CIMultiDict[str]()
@@ -332,8 +327,8 @@ def _init_header(
         headers[HEADER_REMOTE_USER_ID] = session_data.user.id
         if session_data.user.username is not None:
             headers[HEADER_REMOTE_USER_NAME] = session_data.user.username
-        if session_data.user.display_name is not None:
-            headers[HEADER_REMOTE_USER_DISPLAY_NAME] = session_data.user.display_name
+        if session_data.user.name is not None:
+            headers[HEADER_REMOTE_USER_DISPLAY_NAME] = session_data.user.name
 
     # filter flags
     for name, value in request.headers.items():

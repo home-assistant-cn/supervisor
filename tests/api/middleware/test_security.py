@@ -9,8 +9,8 @@ from aiohttp.test_utils import TestClient
 import pytest
 import urllib3
 
-from supervisor.addons.addon import Addon
 from supervisor.api import RestAPI
+from supervisor.apps.app import App
 from supervisor.const import ROLE_ALL, CoreState
 from supervisor.coresys import CoreSys
 
@@ -35,7 +35,7 @@ async def api_system(aiohttp_client, coresys: CoreSys) -> TestClient:
     api.webapp.middlewares.append(api.security.system_validation)
     api.webapp.router.add_get("/{all:.*}", mock_handler)
 
-    yield await aiohttp_client(api.webapp)
+    return await aiohttp_client(api.webapp)
 
 
 @pytest.fixture
@@ -52,7 +52,24 @@ async def api_token_validation(aiohttp_client, coresys: CoreSys) -> TestClient:
     api.webapp.router.add_post("/{all:.*}", mock_handler)
     api.webapp.router.add_delete("/{all:.*}", mock_handler)
 
-    yield await aiohttp_client(api.webapp)
+    return await aiohttp_client(api.webapp)
+
+
+@pytest.fixture(
+    name="api_token_validation_with_prefix",
+    params=[pytest.param("", id="v1"), pytest.param("/v2", id="v2")],
+)
+async def fixture_api_token_validation_with_prefix(
+    request: pytest.FixtureRequest,
+    api_token_validation: TestClient,
+) -> tuple[TestClient, str]:
+    """Provide (client, path_prefix) for token_validation on both API versions.
+
+    Mirrors api_client_with_prefix, but keeps the real token_validation
+    middleware (which api_client/api_client_v2 replace with a stub) so security
+    checks like the blacklist are actually exercised on the v1 and v2 paths.
+    """
+    return api_token_validation, request.param
 
 
 @pytest.fixture(name="plugin_tokens")
@@ -64,7 +81,6 @@ async def fixture_plugin_tokens(coresys: CoreSys) -> None:
     # pylint: enable=protected-access
 
 
-@pytest.mark.asyncio
 async def test_api_security_system_initialize(api_system: TestClient, coresys: CoreSys):
     """Test security."""
     await coresys.core.set_state(CoreState.INITIALIZE)
@@ -75,7 +91,6 @@ async def test_api_security_system_initialize(api_system: TestClient, coresys: C
     assert result["result"] == "error"
 
 
-@pytest.mark.asyncio
 async def test_api_security_system_setup(api_system: TestClient, coresys: CoreSys):
     """Test security."""
     await coresys.core.set_state(CoreState.SETUP)
@@ -86,7 +101,6 @@ async def test_api_security_system_setup(api_system: TestClient, coresys: CoreSy
     assert result["result"] == "error"
 
 
-@pytest.mark.asyncio
 async def test_api_security_system_running(api_system: TestClient, coresys: CoreSys):
     """Test security."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -95,7 +109,6 @@ async def test_api_security_system_running(api_system: TestClient, coresys: Core
     assert resp.status == 200
 
 
-@pytest.mark.asyncio
 async def test_api_security_system_startup(api_system: TestClient, coresys: CoreSys):
     """Test security."""
     await coresys.core.set_state(CoreState.STARTUP)
@@ -104,7 +117,6 @@ async def test_api_security_system_startup(api_system: TestClient, coresys: Core
     assert resp.status == 200
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("request_path", "request_params", "fail_on_query_string"),
     [
@@ -166,8 +178,21 @@ async def test_bad_requests(
     assert message in caplog.text
 
 
+def _versioned_path(prefix: str, path: str) -> str:
+    """Translate a v1 middleware path to the requested API version.
+
+    The v2 sub-app keeps the same paths behind a /v2 prefix, except the add-on
+    routes which are renamed /addons/... -> /apps/.... The role/bypass/core_only
+    expectations are otherwise identical, which is exactly the v1<->v2 pattern
+    parity these tests guard.
+    """
+    if not prefix:
+        return path
+    return prefix + path.replace("/addons", "/apps")
+
+
 @pytest.mark.parametrize(
-    "request_method,request_path,success_roles",
+    ("request_method", "request_path", "success_roles"),
     [
         ("post", "/auth/reset", {"admin"}),
         ("get", "/auth/list", {"admin"}),
@@ -196,35 +221,91 @@ async def test_bad_requests(
 )
 @pytest.mark.usefixtures("plugin_tokens")
 async def test_token_validation(
-    api_token_validation: TestClient,
-    install_addon_example: Addon,
+    api_token_validation_with_prefix: tuple[TestClient, str],
+    install_app_example: App,
     request_method: str,
     request_path: str,
     success_roles: set[str],
 ):
-    """Test token validation paths."""
-    install_addon_example.persist["access_token"] = "abc123"
-    install_addon_example.data["hassio_api"] = True
+    """Test token validation paths on both API versions."""
+    client, prefix = api_token_validation_with_prefix
+    request_path = _versioned_path(prefix, request_path)
+    install_app_example.persist["access_token"] = "abc123"
+    install_app_example.data["hassio_api"] = True
     for role in success_roles:
-        install_addon_example.data["hassio_role"] = role
-        resp = await getattr(api_token_validation, request_method)(
+        install_app_example.data["hassio_role"] = role
+        resp = await getattr(client, request_method)(
             request_path, headers={"Authorization": "Bearer abc123"}
         )
         assert resp.status == 200
 
     for role in set(ROLE_ALL) - success_roles:
-        install_addon_example.data["hassio_role"] = role
-        resp = await getattr(api_token_validation, request_method)(
+        install_app_example.data["hassio_role"] = role
+        resp = await getattr(client, request_method)(
             request_path, headers={"Authorization": "Bearer abc123"}
         )
         assert resp.status == 403
 
 
 @pytest.mark.usefixtures("plugin_tokens")
-async def test_home_assistant_paths(api_token_validation: TestClient, coresys: CoreSys):
-    """Test Home Assistant only paths."""
+async def test_home_assistant_paths(
+    api_token_validation_with_prefix: tuple[TestClient, str], coresys: CoreSys
+):
+    """Test Home Assistant only paths on both API versions."""
+    client, prefix = api_token_validation_with_prefix
     coresys.homeassistant.supervisor_token = "abc123"
-    resp = await api_token_validation.post(
-        "/addons/local_test/sys_options", headers={"Authorization": "Bearer abc123"}
+    resp = await client.post(
+        _versioned_path(prefix, "/addons/local_test/sys_options"),
+        headers={"Authorization": "Bearer abc123"},
     )
     assert resp.status == 200
+
+
+@pytest.mark.usefixtures("plugin_tokens")
+async def test_blacklist(
+    api_token_validation_with_prefix: tuple[TestClient, str],
+    install_app_example: App,
+):
+    """Test the Core API hassio loopback is blocked on every API version."""
+    client, prefix = api_token_validation_with_prefix
+    install_app_example.persist["access_token"] = "abc123"
+    install_app_example.data["hassio_api"] = True
+    install_app_example.data["hassio_role"] = "admin"
+
+    # The hassio loopback is blacklisted regardless of role
+    resp = await client.get(
+        f"{prefix}/core/api/hassio/app", headers={"Authorization": "Bearer abc123"}
+    )
+    assert resp.status == 403
+
+    # A normal (non-hassio) Core API call through the same proxy is allowed
+    resp = await client.get(
+        f"{prefix}/core/api/states", headers={"Authorization": "Bearer abc123"}
+    )
+    assert resp.status == 200
+
+
+@pytest.mark.usefixtures("plugin_tokens")
+async def test_blacklist_legacy_alias(
+    api_token_validation: TestClient,
+    install_app_example: App,
+):
+    """Test the legacy /homeassistant proxy alias (v1 only) is blacklisted."""
+    install_app_example.persist["access_token"] = "abc123"
+    install_app_example.data["hassio_api"] = True
+    install_app_example.data["hassio_role"] = "admin"
+
+    resp = await api_token_validation.get(
+        "/homeassistant/api/hassio/app", headers={"Authorization": "Bearer abc123"}
+    )
+    assert resp.status == 403
+
+
+async def test_api_security_system_stopping(api_system: TestClient, coresys: CoreSys):
+    """Test API requests are rejected while the Supervisor is stopping."""
+    await coresys.core.set_state(CoreState.STOPPING)
+
+    resp = await api_system.get("/supervisor/ping")
+    result = await resp.json()
+    assert resp.status == 400
+    assert result["result"] == "error"

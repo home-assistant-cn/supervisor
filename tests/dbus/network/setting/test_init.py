@@ -33,7 +33,7 @@ async def fixture_dbus_interface(
     """Get connected dbus interface."""
     dbus_interface = NetworkInterface(device_object_path)
     await dbus_interface.connect(dbus_session_bus)
-    yield dbus_interface
+    return dbus_interface
 
 
 @pytest.mark.parametrize(
@@ -57,7 +57,7 @@ async def test_ethernet_update(
         uuid=dbus_interface.settings.connection.uuid,
     )
 
-    await dbus_interface.settings.update(conn)
+    assert await dbus_interface.settings.update(conn) is True
 
     assert len(connection_settings_service.Update.calls) == 1
     settings = connection_settings_service.Update.calls[0][0]
@@ -120,6 +120,10 @@ async def test_ethernet_update(
 
         assert "802-11-wireless-security" not in settings
 
+    # Applying the same settings again does not change the profile
+    assert await dbus_interface.settings.update(conn) is False
+    assert len(connection_settings_service.Update.calls) == 2
+
 
 async def test_ipv6_disabled_is_link_local(
     dbus_interface: NetworkInterface, network_manager: NetworkManager
@@ -140,7 +144,7 @@ async def test_ipv6_disabled_is_link_local(
 
 
 @pytest.mark.parametrize(
-    ["version", "addr_gen_mode"],
+    ("version", "addr_gen_mode"),
     [
         ("1.38.0", 1),
         ("1.40.0", 3),
@@ -151,7 +155,7 @@ async def test_ipv6_addr_gen_mode(
 ):
     """Test addr_gen_mode with various NetworkManager versions."""
     interface = Interface.from_dbus_interface(dbus_interface)
-    interface.ipv6setting = Ip6Setting(InterfaceMethod.AUTO, [], None, [])
+    interface.ipv6setting = Ip6Setting(InterfaceMethod.AUTO, [], None, None, [])
 
     network_manager = MagicMock()
     type(network_manager).version = PropertyMock(return_value=AwesomeVersion(version))

@@ -10,7 +10,7 @@ from pathlib import Path
 from shutil import copy
 from typing import cast
 
-from ..addons.addon import Addon
+from ..apps.app import App
 from ..const import (
     ATTR_DAYS_UNTIL_STALE,
     FILE_HASSIO_BACKUPS,
@@ -150,10 +150,7 @@ class BackupManager(FileConfiguration, JobGroup):
             location not in (DEFAULT, LOCATION_CLOUD_BACKUP, None)
             and not await (location_mount := cast(Mount, location)).is_mounted()
         ):
-            raise BackupMountDownError(
-                f"{location_mount.name} is down, cannot back-up to it",
-                _LOGGER.error,
-            )
+            raise BackupMountDownError(mount=location_mount.name)
 
     def _get_location_name(
         self,
@@ -210,13 +207,11 @@ class BackupManager(FileConfiguration, JobGroup):
         try:
             return await self.sys_run_in_executor(find_backups)
         except OSError as err:
-            if err.errno == errno.EBADMSG and path in {
+            if path in {
                 self.sys_config.path_backup,
                 self.sys_config.path_core_backup,
             }:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+                self.sys_resolution.check_oserror(err)
             _LOGGER.error("Could not list backups from %s: %s", path.as_posix(), err)
 
         return []
@@ -250,7 +245,7 @@ class BackupManager(FileConfiguration, JobGroup):
         # Add backup ID to job
         self.sys_jobs.current.reference = backup.slug
 
-        self._change_stage(BackupJobStage.ADDON_REPOSITORIES, backup)
+        self._change_stage(BackupJobStage.APP_REPOSITORIES, backup)
         backup.store_repositories()
 
         return backup
@@ -300,10 +295,16 @@ class BackupManager(FileConfiguration, JobGroup):
             if location == DEFAULT
             else {location_name: self.backup_locations[location_name]}
         )
+        # List the backup files of all locations in parallel; a slow or
+        # network-backed location should not hold up the others.
+        location_items = list(locations.items())
+        location_files = await asyncio.gather(
+            *(self._list_backup_files(path) for _, path in location_items)
+        )
         tasks = [
             self.sys_create_task(_load_backup(_location, tar_file))
-            for _location, path in locations.items()
-            for tar_file in await self._list_backup_files(path)
+            for (_location, _), tar_files in zip(location_items, location_files)
+            for tar_file in tar_files
         ]
 
         _LOGGER.info("Found %d backup files", len(tasks))
@@ -364,14 +365,9 @@ class BackupManager(FileConfiguration, JobGroup):
                     _LOGGER.error,
                 ) from err
             except OSError as err:
-                msg = f"Could delete backup at {backup_tarfile.as_posix()}: {err!s}"
-                if err.errno == errno.EBADMSG and location in {
-                    None,
-                    LOCATION_CLOUD_BACKUP,
-                }:
-                    self.sys_resolution.add_unhealthy_reason(
-                        UnhealthyReason.OSERROR_BAD_MESSAGE
-                    )
+                msg = f"Cannot delete backup at {backup_tarfile.as_posix()}: {err!s}"
+                if location in {None, LOCATION_CLOUD_BACKUP}:
+                    self.sys_resolution.check_oserror(err)
                 raise BackupError(msg, _LOGGER.error) from err
 
         # If backup has been removed from all locations, remove it from cache
@@ -391,10 +387,7 @@ class BackupManager(FileConfiguration, JobGroup):
             elif location:
                 location_mount = cast(Mount, location)
                 if not location_mount.local_where.is_mount():
-                    raise BackupMountDownError(
-                        f"{location_mount.name} is down, cannot copy to it",
-                        _LOGGER.error,
-                    )
+                    raise BackupMountDownError(mount=location_mount.name)
                 destination = location_mount.local_where
             else:
                 destination = self.sys_config.path_backup
@@ -403,12 +396,10 @@ class BackupManager(FileConfiguration, JobGroup):
             return (location_name, Path(path))
         except OSError as err:
             msg = f"Could not copy backup to {location_name} due to: {err!s}"
-
-            if err.errno == errno.EBADMSG and location in {
-                LOCATION_CLOUD_BACKUP,
-                None,
-            }:
-                raise BackupDataDiskBadMessageError(msg, _LOGGER.error) from err
+            if location in {LOCATION_CLOUD_BACKUP, None}:
+                self.sys_resolution.check_oserror(err)
+                if err.errno == errno.EBADMSG:
+                    raise BackupDataDiskBadMessageError(msg, _LOGGER.error) from err
             raise BackupError(msg, _LOGGER.error) from err
 
     @Job(name="backup_copy_to_additional_locations", cleanup=False)
@@ -468,10 +459,8 @@ class BackupManager(FileConfiguration, JobGroup):
         try:
             await self.sys_run_in_executor(backup.tarfile.rename, tar_file)
         except OSError as err:
-            if err.errno == errno.EBADMSG and location in {LOCATION_CLOUD_BACKUP, None}:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            if location in {LOCATION_CLOUD_BACKUP, None}:
+                self.sys_resolution.check_oserror(err)
             _LOGGER.error("Can't move backup file to storage: %s", err)
             return None
 
@@ -485,7 +474,12 @@ class BackupManager(FileConfiguration, JobGroup):
         )
         if not await backup.load():
             # Remove invalid backup from location it was moved to
-            await self.sys_run_in_executor(backup.tarfile.unlink)
+            try:
+                await self.sys_run_in_executor(backup.tarfile.unlink)
+            except OSError as err:
+                if location in {LOCATION_CLOUD_BACKUP, None}:
+                    self.sys_resolution.check_oserror(err)
+                _LOGGER.error("Can't remove invalid backup file: %s", err)
             return None
         _LOGGER.info("Successfully imported %s", backup.slug)
 
@@ -498,7 +492,12 @@ class BackupManager(FileConfiguration, JobGroup):
             try:
                 self._backups[backup.slug].consolidate(backup)
             except BackupInvalidError as err:
-                backup.tarfile.unlink()
+                try:
+                    await self.sys_run_in_executor(backup.tarfile.unlink)
+                except OSError as unlink_err:
+                    if location in {LOCATION_CLOUD_BACKUP, None}:
+                        self.sys_resolution.check_oserror(unlink_err)
+                    _LOGGER.error("Can't remove invalid backup file: %s", unlink_err)
                 raise BackupInvalidError(
                     f"Cannot import backup {backup.slug} due to: {err!s}", _LOGGER.error
                 ) from err
@@ -513,7 +512,7 @@ class BackupManager(FileConfiguration, JobGroup):
     async def _do_backup(
         self,
         backup: Backup,
-        addon_list: list[Addon],
+        app_list: list[App],
         folder_list: list[str],
         homeassistant: bool,
         homeassistant_exclude_database: bool | None,
@@ -524,11 +523,15 @@ class BackupManager(FileConfiguration, JobGroup):
         Must be called from an existing backup job. If the backup failed, the
         backup file is being deleted and None is returned.
         """
-        addon_start_tasks: list[Awaitable[None]] | None = None
+        app_start_tasks: list[Awaitable[None]] | None = None
 
         try:
             await self.sys_core.set_state(CoreState.FREEZE)
 
+            # Any exception leaving create() means the backup is incomplete
+            # and will be discarded (file unlinked below). Individual
+            # app/folder errors are captured inside store_addons/
+            # store_folders and do not propagate.
             async with backup.create():
                 # HomeAssistant Folder is for v1
                 if homeassistant:
@@ -539,15 +542,19 @@ class BackupManager(FileConfiguration, JobGroup):
                         else homeassistant_exclude_database
                     )
 
-                # Backup add-ons
-                if addon_list:
-                    self._change_stage(BackupJobStage.ADDONS, backup)
-                    addon_start_tasks = await backup.store_addons(addon_list)
+                # Backup apps
+                if app_list:
+                    self._change_stage(BackupJobStage.APPS, backup)
+                    app_start_tasks = await backup.store_apps(app_list)
 
                 # Backup folders
                 if folder_list:
                     self._change_stage(BackupJobStage.FOLDERS, backup)
                     await backup.store_folders(folder_list)
+
+                # Backup supervisor configuration (mounts, etc.)
+                self._change_stage(BackupJobStage.SUPERVISOR_CONFIG, backup)
+                await backup.store_supervisor_config()
 
                 self._change_stage(BackupJobStage.FINISHING_FILE, backup)
 
@@ -568,13 +575,13 @@ class BackupManager(FileConfiguration, JobGroup):
             self._backups[backup.slug] = backup
 
             if additional_locations:
-                self._change_stage(BackupJobStage.COPY_ADDITONAL_LOCATIONS, backup)
+                self._change_stage(BackupJobStage.COPY_ADDITIONAL_LOCATIONS, backup)
                 await self._copy_to_additional_locations(backup, additional_locations)
 
-            if addon_start_tasks:
-                self._change_stage(BackupJobStage.AWAIT_ADDON_RESTARTS, backup)
-                # Ignore exceptions from waiting for addon startup, addon errors handled elsewhere
-                await asyncio.gather(*addon_start_tasks, return_exceptions=True)
+            if app_start_tasks:
+                self._change_stage(BackupJobStage.AWAIT_APP_RESTARTS, backup)
+                # Ignore exceptions from waiting for app startup, app errors handled elsewhere
+                await asyncio.gather(*app_start_tasks, return_exceptions=True)
 
             return backup
         finally:
@@ -622,7 +629,7 @@ class BackupManager(FileConfiguration, JobGroup):
         _LOGGER.info("Creating new full backup with slug %s", new_backup.slug)
         backup = await self._do_backup(
             new_backup,
-            self.sys_addons.installed,
+            self.sys_apps.installed,
             ALL_FOLDERS,
             True,
             homeassistant_exclude_database,
@@ -644,7 +651,7 @@ class BackupManager(FileConfiguration, JobGroup):
         name: str = "",
         filename: str | None = None,
         *,
-        addons: list[str] | None = None,
+        apps: list[str] | None = None,
         folders: list[str] | None = None,
         password: str | None = None,
         homeassistant: bool = False,
@@ -666,7 +673,7 @@ class BackupManager(FileConfiguration, JobGroup):
                 self, {JobCondition.FREE_SPACE}, "BackupManager.do_backup_partial"
             )
 
-        addons = addons or []
+        apps = apps or []
         folders = folders or []
 
         # HomeAssistant Folder is for v1
@@ -674,7 +681,7 @@ class BackupManager(FileConfiguration, JobGroup):
             folders.remove(FOLDER_HOMEASSISTANT)
             homeassistant = True
 
-        if len(addons) == 0 and len(folders) == 0 and not homeassistant:
+        if len(apps) == 0 and len(folders) == 0 and not homeassistant:
             _LOGGER.error("Nothing to create backup for")
 
         new_backup = self._create_backup(
@@ -682,13 +689,13 @@ class BackupManager(FileConfiguration, JobGroup):
         )
 
         _LOGGER.info("Creating new partial backup with slug %s", new_backup.slug)
-        addon_list = []
-        for addon_slug in addons:
-            addon = self.sys_addons.get(addon_slug)
-            if addon and addon.is_installed:
-                addon_list.append(cast(Addon, addon))
+        app_list = []
+        for app_slug in apps:
+            app = self.sys_apps.get(app_slug)
+            if app and app.is_installed:
+                app_list.append(cast(App, app))
                 continue
-            _LOGGER.warning("Add-on %s not found/installed", addon_slug)
+            _LOGGER.warning("App %s not found/installed", app_slug)
 
         # If being run in the background, notify caller that validation has completed
         if validation_complete:
@@ -696,7 +703,7 @@ class BackupManager(FileConfiguration, JobGroup):
 
         backup = await self._do_backup(
             new_backup,
-            addon_list,
+            app_list,
             folders,
             homeassistant,
             homeassistant_exclude_database,
@@ -709,7 +716,7 @@ class BackupManager(FileConfiguration, JobGroup):
     async def _do_restore(
         self,
         backup: Backup,
-        addon_list: list[str],
+        app_list: list[str],
         folder_list: list[str],
         homeassistant: bool,
         replace: bool,
@@ -719,7 +726,7 @@ class BackupManager(FileConfiguration, JobGroup):
 
         Must be called from an existing restore job.
         """
-        addon_start_tasks: list[Awaitable[None]] | None = None
+        app_start_tasks: list[Awaitable[None]] | None = None
         success = True
 
         try:
@@ -735,20 +742,28 @@ class BackupManager(FileConfiguration, JobGroup):
                     self._change_stage(RestoreJobStage.HOME_ASSISTANT, backup)
                     task_hass = await backup.restore_homeassistant()
 
-                # Delete delta add-ons
+                # Delete delta apps
                 if replace:
-                    self._change_stage(RestoreJobStage.REMOVE_DELTA_ADDONS, backup)
-                    success = success and await backup.remove_delta_addons()
+                    self._change_stage(RestoreJobStage.REMOVE_DELTA_APPS, backup)
+                    success = success and await backup.remove_delta_apps()
 
-                if addon_list:
-                    self._change_stage(RestoreJobStage.ADDON_REPOSITORIES, backup)
+                if app_list:
+                    self._change_stage(RestoreJobStage.APP_REPOSITORIES, backup)
                     await backup.restore_repositories(replace)
 
-                    self._change_stage(RestoreJobStage.ADDONS, backup)
-                    restore_success, addon_start_tasks = await backup.restore_addons(
-                        addon_list
+                    self._change_stage(RestoreJobStage.APPS, backup)
+                    restore_success, app_start_tasks = await backup.restore_apps(
+                        app_list
                     )
                     success = success and restore_success
+
+                # Restore supervisor configuration (mounts, etc.)
+                self._change_stage(RestoreJobStage.SUPERVISOR_CONFIG, backup)
+                (
+                    mount_success,
+                    mount_tasks,
+                ) = await backup.restore_supervisor_config()
+                success = success and mount_success
 
                 # Wait for Home Assistant Core update/downgrade
                 if task_hass:
@@ -762,13 +777,19 @@ class BackupManager(FileConfiguration, JobGroup):
                 f"Restore {backup.slug} error, see supervisor logs"
             ) from err
         else:
-            if addon_start_tasks:
-                self._change_stage(RestoreJobStage.AWAIT_ADDON_RESTARTS, backup)
-                # Failure to resume addons post restore is still a restore failure
-                if any(
-                    await asyncio.gather(*addon_start_tasks, return_exceptions=True)
-                ):
+            if app_start_tasks:
+                self._change_stage(RestoreJobStage.AWAIT_APP_RESTARTS, backup)
+                # Failure to resume apps post restore is still a restore failure
+                if any(await asyncio.gather(*app_start_tasks, return_exceptions=True)):
                     return False
+
+            # Wait for mount activations (failures don't affect restore success
+            # since config was already saved)
+            if mount_tasks:
+                results = await asyncio.gather(*mount_tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        _LOGGER.warning("Mount activation error: %s", result)
 
             return success
         finally:
@@ -858,12 +879,12 @@ class BackupManager(FileConfiguration, JobGroup):
         await self.sys_core.set_state(CoreState.FREEZE)
 
         try:
-            # Stop Home-Assistant / Add-ons
-            await self.sys_core.shutdown(remove_homeassistant_container=True)
+            # Stop Home-Assistant / Apps
+            await self.sys_core.teardown_services(remove_homeassistant_container=True)
 
             success = await self._do_restore(
                 backup,
-                backup.addon_list,
+                backup.app_list,
                 backup.folders,
                 homeassistant=True,
                 replace=True,
@@ -894,7 +915,7 @@ class BackupManager(FileConfiguration, JobGroup):
         backup: Backup,
         *,
         homeassistant: bool = False,
-        addons: list[str] | None = None,
+        apps: list[str] | None = None,
         folders: list[str] | None = None,
         password: str | None = None,
         location: str | None | type[DEFAULT] = DEFAULT,
@@ -904,7 +925,7 @@ class BackupManager(FileConfiguration, JobGroup):
         # Add backup ID to job
         self.sys_jobs.current.reference = backup.slug
 
-        addon_list = addons or []
+        app_list = apps or []
         folder_list = folders or []
 
         # Version 1
@@ -936,7 +957,7 @@ class BackupManager(FileConfiguration, JobGroup):
         try:
             success = await self._do_restore(
                 backup,
-                addon_list,
+                app_list,
                 folder_list,
                 homeassistant=homeassistant,
                 replace=False,
@@ -959,27 +980,27 @@ class BackupManager(FileConfiguration, JobGroup):
         """Freeze system to prepare for an external backup such as an image snapshot."""
         await self.sys_core.set_state(CoreState.FREEZE)
 
-        # Determine running addons
-        installed = self.sys_addons.installed.copy()
+        # Determine running apps
+        installed = self.sys_apps.installed.copy()
         is_running: list[bool] = await asyncio.gather(
-            *[addon.is_running() for addon in installed]
+            *[app.is_running() for app in installed]
         )
-        running_addons = [
-            installed[ind] for ind in range(len(installed)) if is_running[ind]
+        running_apps = [
+            app for app, running in zip(installed, is_running, strict=True) if running
         ]
 
         # Create thaw task first to ensure we eventually undo freezes even if the below fails
         self._thaw_task = asyncio.shield(
-            self.sys_create_task(self._thaw_all(running_addons, timeout))
+            self.sys_create_task(self._thaw_all(running_apps, timeout))
         )
 
         # Tell Home Assistant to freeze for a backup
         self._change_stage(BackupJobStage.HOME_ASSISTANT)
         await self.sys_homeassistant.begin_backup()
 
-        # Run all pre-backup tasks for addons
-        self._change_stage(BackupJobStage.ADDONS)
-        await asyncio.gather(*[addon.begin_backup() for addon in running_addons])
+        # Run all pre-backup tasks for apps
+        self._change_stage(BackupJobStage.APPS)
+        await asyncio.gather(*[app.begin_backup() for app in running_apps])
 
     @Job(
         name="backup_manager_thaw_all",
@@ -987,7 +1008,7 @@ class BackupManager(FileConfiguration, JobGroup):
         on_condition=BackupJobError,
     )
     async def _thaw_all(
-        self, running_addons: list[Addon], timeout: float = DEFAULT_FREEZE_TIMEOUT
+        self, running_apps: list[App], timeout: float = DEFAULT_FREEZE_TIMEOUT
     ) -> None:
         """Thaw system after user signal or timeout."""
         try:
@@ -1001,11 +1022,11 @@ class BackupManager(FileConfiguration, JobGroup):
             self._change_stage(BackupJobStage.HOME_ASSISTANT)
             await self.sys_homeassistant.end_backup()
 
-            self._change_stage(BackupJobStage.ADDONS)
-            addon_start_tasks: list[asyncio.Task] = [
+            self._change_stage(BackupJobStage.APPS)
+            app_start_tasks: list[asyncio.Task] = [
                 task
                 for task in await asyncio.gather(
-                    *[addon.end_backup() for addon in running_addons]
+                    *[app.end_backup() for app in running_apps]
                 )
                 if task
             ]
@@ -1014,9 +1035,9 @@ class BackupManager(FileConfiguration, JobGroup):
             self._thaw_event.clear()
             self._thaw_task = None
 
-        if addon_start_tasks:
-            self._change_stage(BackupJobStage.AWAIT_ADDON_RESTARTS)
-            await asyncio.gather(*addon_start_tasks, return_exceptions=True)
+        if app_start_tasks:
+            self._change_stage(BackupJobStage.AWAIT_APP_RESTARTS)
+            await asyncio.gather(*app_start_tasks, return_exceptions=True)
 
     @Job(
         name="backup_manager_signal_thaw",

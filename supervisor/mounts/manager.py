@@ -2,17 +2,22 @@
 
 import asyncio
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, replace
 import logging
 from pathlib import PurePath
 from typing import Self
 
-from attr import evolve
-
 from ..const import ATTR_NAME
 from ..coresys import CoreSys, CoreSysAttributes
 from ..dbus.const import UnitActiveState
-from ..exceptions import MountActivationError, MountError, MountJobError, MountNotFound
+from ..exceptions import (
+    MountError,
+    MountJobError,
+    MountNotFound,
+    MountTargetNotDirectoryError,
+    MountTargetNotEmptyError,
+)
 from ..host.const import HostFeature
 from ..jobs.const import JobCondition
 from ..jobs.decorator import Job
@@ -160,7 +165,9 @@ class MountManager(FileConfiguration, CoreSysAttributes):
         )
 
         # Try to reload failed mounts and report issues if failure persists
-        failures = [mounts[i] for i in range(len(mounts)) if results[i] is not True]
+        failures = [
+            mount for mount, result in zip(mounts, results) if result is not True
+        ]
         await self._mount_errors_to_issues(
             failures, [self.reload_mount(mount.name) for mount in failures]
         )
@@ -180,7 +187,7 @@ class MountManager(FileConfiguration, CoreSysAttributes):
                 await async_capture_exception(err)
 
             self.sys_resolution.add_issue(
-                evolve(mounts[i].failed_issue),
+                replace(mounts[i].failed_issue),
                 suggestions=[
                     SuggestionType.EXECUTE_RELOAD,
                     SuggestionType.EXECUTE_REMOVE,
@@ -197,22 +204,70 @@ class MountManager(FileConfiguration, CoreSysAttributes):
         # Add mount name to job
         self.sys_jobs.current.reference = mount.name
 
+        await self._check_local_data_conflict(mount)
+
         if mount.name in self._mounts:
-            _LOGGER.debug("Mount '%s' exists, unmounting then mounting from new config")
+            _LOGGER.debug(
+                "Mount '%s' exists, unmounting then mounting from new config",
+                mount.name,
+            )
             await self.remove_mount(mount.name, retain_entry=True)
 
         _LOGGER.info("Creating or updating mount: %s", mount.name)
         try:
             await mount.load()
-        except MountActivationError as err:
-            await mount.unmount()
-            raise err
+            if mount.usage == MountUsage.MEDIA:
+                await self._bind_media(mount)
+            elif mount.usage == MountUsage.SHARE:
+                await self._bind_share(mount)
+        except MountError:
+            # Roll back so a failed add/update does not leave a half-created
+            # mount behind: data mount active and listed, but without bind
+            # mount and never persisted to the configuration.
+            if bound_mount := self._bound_mounts.pop(mount.name, None):
+                with suppress(MountError):
+                    await bound_mount.bind_mount.unmount()
+            with suppress(MountError):
+                await mount.unmount()
+            raise
 
         self._mounts[mount.name] = mount
+
+    async def _check_local_data_conflict(self, mount: Mount) -> None:
+        """Fail fast if a target directory of the mount contains local data.
+
+        The authoritative check happens when each unit is mounted, but by
+        then the data mount is already active. Checking upfront lets an
+        add/update whose target directory holds local data (e.g. written by
+        an add-on while no mount was in place) fail cleanly before anything
+        is touched. Paths that are already mount points are skipped — they
+        get unmounted before reuse.
+        """
+        paths = [mount.local_where]
         if mount.usage == MountUsage.MEDIA:
-            await self._bind_media(mount)
+            paths.append(self.sys_config.path_media / mount.name)
         elif mount.usage == MountUsage.SHARE:
-            await self._bind_share(mount)
+            paths.append(self.sys_config.path_share / mount.name)
+
+        def check_conflict() -> None:
+            for path in paths:
+                try:
+                    if path.is_mount() or not path.exists():
+                        continue
+                    if not path.is_dir():
+                        raise MountTargetNotDirectoryError(
+                            _LOGGER.error, name=mount.name, path=path.as_posix()
+                        )
+                    if any(path.iterdir()):
+                        raise MountTargetNotEmptyError(
+                            _LOGGER.error, name=mount.name, path=path.as_posix()
+                        )
+                except OSError:
+                    # Not inspectable (e.g. an unreachable network mount) —
+                    # leave it to the mount-time check
+                    continue
+
+        await self.sys_run_in_executor(check_conflict)
 
     @Job(
         name="mount_manager_remove_mount",
@@ -262,7 +317,12 @@ class MountManager(FileConfiguration, CoreSysAttributes):
         _LOGGER.info("Reloading mount: %s", name)
         await self._mounts[name].reload()
 
-        if (bound_mount := self._bound_mounts.get(name)) and bound_mount.emergency:
+        # Always re-create the bind mount into media/share. systemd adds an
+        # implicit Requires= dependency from the bind unit to the data mount
+        # unit (via RequiresMountsFor= on its What= path), so stopping or
+        # restarting a failed data mount tears down the bind mount as well —
+        # our BoundMount bookkeeping cannot know whether that happened.
+        if bound_mount := self._bound_mounts.get(name):
             await self._bind_mount(bound_mount.mount, bound_mount.bind_mount.where)
 
     async def _bind_media(self, mount: Mount) -> None:
@@ -319,3 +379,52 @@ class MountManager(FileConfiguration, CoreSysAttributes):
             mount.to_dict(skip_secrets=False) for mount in self.mounts
         ]
         await super().save_data()
+
+    async def restore_mount(self, mount: Mount) -> asyncio.Task:
+        """Restore a mount from backup.
+
+        Adds mount to internal state without activating it.
+        Returns an asyncio.Task for activating the mount in the background.
+        If a mount with the same name exists, it is replaced.
+        """
+        if mount.name in self._mounts:
+            _LOGGER.info(
+                "Mount '%s' already exists, replacing with backup config", mount.name
+            )
+            # Unmount existing if it's bound
+            if mount.name in self._bound_mounts:
+                await self._bound_mounts[mount.name].bind_mount.unmount()
+                del self._bound_mounts[mount.name]
+
+            old_mount = self._mounts[mount.name]
+            await old_mount.unmount()
+
+        self._mounts[mount.name] = mount
+        return self.sys_create_task(self._activate_restored_mount(mount))
+
+    async def _activate_restored_mount(self, mount: Mount) -> None:
+        """Activate a restored mount. Logs errors but doesn't raise."""
+        if HostFeature.MOUNT not in self.sys_host.features:
+            _LOGGER.warning(
+                "Cannot activate mount %s, mounting not supported on system",
+                mount.name,
+            )
+            return
+
+        try:
+            _LOGGER.info("Activating restored mount: %s", mount.name)
+            await mount.load()
+
+            if mount.usage == MountUsage.MEDIA:
+                await self._bind_media(mount)
+            elif mount.usage == MountUsage.SHARE:
+                await self._bind_share(mount)
+
+            _LOGGER.info("Mount %s activated successfully", mount.name)
+        except MountError as err:
+            _LOGGER.warning(
+                "Failed to activate mount %s (config was restored, "
+                "mount may come online later): %s",
+                mount.name,
+                err,
+            )

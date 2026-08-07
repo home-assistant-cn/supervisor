@@ -3,33 +3,39 @@
 import asyncio
 from collections.abc import AsyncGenerator, Generator
 from datetime import datetime
-import os
 from pathlib import Path
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
 from uuid import uuid4
 
+from aiodocker.channel import Channel, ChannelSubscriber
+from aiodocker.containers import DockerContainer, DockerContainers
 from aiodocker.docker import DockerImages
+from aiodocker.events import DockerEvents
+from aiodocker.execs import Exec
+from aiodocker.networks import DockerNetwork, DockerNetworks
+from aiodocker.system import DockerSystem
+from aiodocker.volumes import DockerVolumes
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
-from blockbuster import BlockBuster, blockbuster_ctx
+from blockbuster import BlockBuster, BlockBusterFunction
 from dbus_fast import BusType
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
-from securetar import SecureTarFile
+from securetar import SecureTarArchive
 
 from supervisor import config as su_config
-from supervisor.addons.addon import Addon
-from supervisor.addons.validate import SCHEMA_ADDON_SYSTEM
 from supervisor.api import RestAPI
+from supervisor.apps.app import App
+from supervisor.apps.validate import SCHEMA_APP_SYSTEM
 from supervisor.backups.backup import Backup
 from supervisor.backups.const import BackupType
 from supervisor.backups.validate import ALL_FOLDERS
 from supervisor.bootstrap import initialize_coresys
 from supervisor.const import (
     ATTR_ADDONS,
-    ATTR_ADDONS_CUSTOM_LIST,
+    ATTR_APPS_CUSTOM_LIST,
     ATTR_DATE,
     ATTR_EXCLUDE_DATABASE,
     ATTR_FOLDERS,
@@ -42,40 +48,38 @@ from supervisor.const import (
     ATTR_VERSION,
     REQUEST_FROM,
     CoreState,
+    CpuArch,
 )
 from supervisor.coresys import CoreSys
 from supervisor.dbus.network import NetworkManager
 from supervisor.docker.manager import DockerAPI
-from supervisor.docker.monitor import DockerMonitor
 from supervisor.exceptions import HostLogError
 from supervisor.homeassistant.api import APIState
 from supervisor.host.logs import LogsControl
 from supervisor.os.manager import OSManager
-from supervisor.store.addon import AddonStore
+from supervisor.store.app import AppStore
 from supervisor.store.repository import Repository
 from supervisor.utils.dt import utcnow
 
 from .common import (
     AsyncIterator,
     MockResponse,
-    load_binary_fixture,
     load_fixture,
     load_json_fixture,
     mock_dbus_services,
 )
 from .const import TEST_ADDON_SLUG
 from .dbus_service_mocks.base import DBusServiceMock
+from .dbus_service_mocks.network_active_connection import (
+    DEFAULT_OBJECT_PATH as DEFAULT_ACTIVE_CONNECTION_OBJECT_PATH,
+    ActiveConnection as ActiveConnectionService,
+)
 from .dbus_service_mocks.network_connection_settings import (
     DEFAULT_OBJECT_PATH as DEFAULT_CONNECTION_SETTINGS_OBJECT_PATH,
     ConnectionSettings as ConnectionSettingsService,
 )
 from .dbus_service_mocks.network_dns_manager import DnsManager as DnsManagerService
 from .dbus_service_mocks.network_manager import NetworkManager as NetworkManagerService
-
-from tests.dbus_service_mocks.network_active_connection import (
-    DEFAULT_OBJECT_PATH as DEFAULT_ACTIVE_CONNECTION_OBJECT_PATH,
-    ActiveConnection as ActiveConnectionService,
-)
 
 # pylint: disable=redefined-outer-name, protected-access
 
@@ -92,23 +96,29 @@ def blockbuster(request: pytest.FixtureRequest) -> BlockBuster | None:
     # But it will ignore calls to libraries and such that do blocking I/O directly from tests
     # Removing that would be nice but a todo for the future
 
-    # pylint: disable-next=contextmanager-generator-missing-cleanup
-    with blockbuster_ctx(scanned_modules=["supervisor"]) as bb:
-        yield bb
+    SCANNED_MODULES = ["supervisor"]
+    blockbuster = BlockBuster(scanned_modules=SCANNED_MODULES)
+    blockbuster.functions["pathlib.Path.open"] = BlockBusterFunction(
+        Path, "open", scanned_modules=SCANNED_MODULES
+    )
+    blockbuster.functions["pathlib.Path.close"] = BlockBusterFunction(
+        Path, "close", scanned_modules=SCANNED_MODULES
+    )
+    blockbuster.activate()
+    yield blockbuster
+    blockbuster.deactivate()
 
 
 @pytest.fixture
-async def path_extern() -> None:
+async def path_extern(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set external path env for tests."""
-    os.environ["SUPERVISOR_SHARE"] = "/mnt/data/supervisor"
-    yield
+    monkeypatch.setenv("SUPERVISOR_SHARE", "/mnt/data/supervisor")
 
 
 @pytest.fixture
-async def supervisor_name() -> None:
+async def supervisor_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set env for supervisor name."""
-    os.environ["SUPERVISOR_NAME"] = "hassio_supervisor"
-    yield
+    monkeypatch.setenv("SUPERVISOR_NAME", "hassio_supervisor")
 
 
 @pytest.fixture
@@ -120,41 +130,132 @@ async def docker() -> DockerAPI:
         "Id": "test123",
         "RepoTags": ["ghcr.io/home-assistant/amd64-hassio-supervisor:latest"],
     }
+    container_inspect = image_inspect | {
+        "State": {"ExitCode": 0, "Status": "stopped", "Running": False},
+        "Image": "abc123",
+    }
+    network_inspect = {
+        "Name": "hassio",
+        "Id": "hassio123",
+        "EnableIPv4": True,
+        "EnableIPv6": False,
+        "IPAM": {
+            "Driver": "default",
+            "Options": None,
+            "Config": [
+                {
+                    "Subnet": "172.30.32.0/23",
+                    "IPRange": "172.30.33.0/24",
+                    "Gateway": "172.30.32.1",
+                }
+            ],
+        },
+        "Containers": {},
+    }
+    system_info = {
+        "ServerVersion": "1.0.0",
+        "Driver": "overlay2",
+        "LoggingDriver": "journald",
+        "CgroupVersion": "1",
+    }
 
     with (
-        patch("supervisor.docker.manager.DockerClient", return_value=MagicMock()),
         patch(
-            "supervisor.docker.manager.DockerAPI.containers", return_value=MagicMock()
-        ),
-        patch("supervisor.docker.manager.DockerAPI.api", return_value=MagicMock()),
-        patch("supervisor.docker.manager.DockerAPI.info", return_value=MagicMock()),
-        patch("supervisor.docker.manager.DockerAPI.unload"),
-        patch("supervisor.docker.manager.aiodocker.Docker", return_value=MagicMock()),
-        patch(
-            "supervisor.docker.manager.DockerAPI.images",
-            new=PropertyMock(
-                return_value=(docker_images := MagicMock(spec=DockerImages))
+            "supervisor.docker.manager.aiodocker.Docker",
+            return_value=(
+                MagicMock(
+                    networks=(docker_networks := MagicMock(spec=DockerNetworks)),
+                    images=(docker_images := MagicMock(spec=DockerImages)),
+                    containers=(docker_containers := MagicMock(spec=DockerContainers)),
+                    events=(docker_events := MagicMock(spec=DockerEvents)),
+                    system=(docker_system := MagicMock(spec=DockerSystem)),
+                    volumes=MagicMock(spec=DockerVolumes),
+                )
             ),
         ),
+        patch(
+            "supervisor.docker.manager.DockerAPI.images",
+            new=PropertyMock(return_value=docker_images),
+        ),
+        patch(
+            "supervisor.docker.manager.DockerAPI.containers",
+            new=PropertyMock(return_value=docker_containers),
+        ),
     ):
-        docker_obj = await DockerAPI(MagicMock()).post_init()
-        docker_obj.config._data = {"registries": {}}
-        with patch("supervisor.docker.monitor.DockerMonitor.load"):
-            await docker_obj.load()
+        # Info mocking
+        docker_system.info.return_value = system_info
 
+        # Network mocking
+        docker_networks.get.return_value = docker_network = MagicMock(
+            spec=DockerNetwork
+        )
+        docker_network.show.return_value = network_inspect
+
+        def create_network_mock(params):
+            mock = MagicMock(spec=DockerNetwork)
+            mock.show.return_value = params | {"Containers": {}}
+            return mock
+
+        docker_networks.create.side_effect = create_network_mock
+
+        # Events mocking
+        docker_events.channel = channel = Channel()
+        docker_events.subscribe.return_value = ChannelSubscriber(channel)
+        docker_events.stop = lambda *_: channel.publish(None)
+
+        # Images mocking
         docker_images.inspect.return_value = image_inspect
         docker_images.list.return_value = [image_inspect]
-        docker_images.import_image.return_value = [
-            {"stream": "Loaded image: test:latest\n"}
-        ]
-
+        docker_images.import_image = AsyncMock(
+            return_value=[{"stream": "Loaded image: test:latest\n"}]
+        )
         docker_images.pull.return_value = AsyncIterator([{}])
 
-        docker_obj.info.logging = "journald"
-        docker_obj.info.storage = "overlay2"
-        docker_obj.info.version = AwesomeVersion("1.0.0")
+        # Export image mocking
+        class MockCM:
+            def __init__(self):
+                self.content = [b""]
+
+            async def __aenter__(self):
+                out = MagicMock()
+                out.iter_chunked.return_value = AsyncIterator(self.content)
+                return out
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        docker_images.export_image.return_value = MockCM()
+
+        # Containers mocking
+        docker_containers.get.return_value = docker_container = MagicMock(
+            spec=DockerContainer, id=container_inspect["Id"]
+        )
+        docker_containers.list.return_value = [docker_container]
+        docker_containers.create.return_value = docker_container
+        docker_container.show.return_value = container_inspect
+        docker_container.wait.return_value = {"StatusCode": 0}
+        docker_container.log = AsyncMock(return_value=[])
+
+        docker_container.exec.return_value = docker_exec = MagicMock(spec=Exec)
+        # start() with detach=False returns a Stream (not async)
+        # Use return_value instead of side_effect to avoid it being replaced by tests
+        docker_exec.start.return_value = create_mock_exec_stream(output=b"")
+        docker_exec.inspect.return_value = {"ExitCode": 0}
+
+        # Load Docker manager
+        docker_obj = await DockerAPI(
+            MagicMock(create_task=asyncio.get_running_loop().create_task)
+        ).post_init()
+        docker_obj.config._data = {"registries": {}}
+        await docker_obj.load()
+
+        # Mock manifest fetcher to return None (falls back to count-based progress)
+        docker_obj._manifest_fetcher.get_manifest = AsyncMock(return_value=None)
 
         yield docker_obj
+
+        # Clean up
+        await docker_obj.unload()
 
 
 @pytest.fixture(scope="session")
@@ -199,7 +300,7 @@ async def fixture_network_manager_services(
     dbus_session_bus: MessageBus,
 ) -> dict[str, DBusServiceMock | dict[str, DBusServiceMock]]:
     """Mock all services network manager connects to."""
-    yield await mock_dbus_services(
+    return await mock_dbus_services(
         {
             "network_access_point": [
                 "/org/freedesktop/NetworkManager/AccessPoint/43099",
@@ -238,7 +339,7 @@ async def network_manager(
     """Mock Network Manager."""
     nm_obj = NetworkManager()
     await nm_obj.connect(dbus_session_bus)
-    yield nm_obj
+    return nm_obj
 
 
 @pytest.fixture
@@ -246,15 +347,15 @@ async def network_manager_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> NetworkManagerService:
     """Return Network Manager service mock."""
-    yield network_manager_services["network_manager"]
+    return network_manager_services["network_manager"]
 
 
 @pytest.fixture
 async def dns_manager_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
-) -> AsyncGenerator[DnsManagerService]:
+) -> DnsManagerService:
     """Return DNS Manager service mock."""
-    yield network_manager_services["network_dns_manager"]
+    return network_manager_services["network_dns_manager"]
 
 
 @pytest.fixture(name="active_connection_service")
@@ -262,7 +363,7 @@ async def fixture_active_connection_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> ActiveConnectionService:
     """Return mock active connection service."""
-    yield network_manager_services["network_active_connection"][
+    return network_manager_services["network_active_connection"][
         DEFAULT_ACTIVE_CONNECTION_OBJECT_PATH
     ]
 
@@ -272,7 +373,7 @@ async def fixture_connection_settings_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> ConnectionSettingsService:
     """Return mock connection settings service."""
-    yield network_manager_services["network_connection_settings"][
+    return network_manager_services["network_connection_settings"][
         DEFAULT_CONNECTION_SETTINGS_OBJECT_PATH
     ]
 
@@ -282,7 +383,7 @@ async def fixture_udisks2_services(
     dbus_session_bus: MessageBus,
 ) -> dict[str, DBusServiceMock | dict[str, DBusServiceMock]]:
     """Mock all services UDisks2 connects to."""
-    yield await mock_dbus_services(
+    return await mock_dbus_services(
         {
             "udisks2_block": [
                 "/org/freedesktop/UDisks2/block_devices/loop0",
@@ -333,7 +434,7 @@ async def fixture_os_agent_services(
     dbus_session_bus: MessageBus,
 ) -> dict[str, DBusServiceMock]:
     """Mock all services os agent connects to."""
-    yield await mock_dbus_services(
+    return await mock_dbus_services(
         {
             "os_agent": None,
             "agent_apparmor": None,
@@ -342,6 +443,7 @@ async def fixture_os_agent_services(
             "agent_swap": None,
             "agent_system": None,
             "agent_boards": None,
+            "agent_boards_rpi_firmware": None,
             "agent_boards_yellow": None,
         },
         dbus_session_bus,
@@ -356,7 +458,7 @@ async def fixture_all_dbus_services(
     os_agent_services: dict[str, DBusServiceMock],
 ) -> dict[str, DBusServiceMock | dict[str, DBusServiceMock]]:
     """Mock all dbus services supervisor uses."""
-    yield (
+    return (
         (
             await mock_dbus_services(
                 {
@@ -377,10 +479,22 @@ async def fixture_all_dbus_services(
     )
 
 
+@pytest.fixture(autouse=True)
+def _mock_firewall():
+    """Mock out firewall rules by default to avoid dbus signal timeouts."""
+    patcher = patch(
+        "supervisor.host.firewall.FirewallManager.apply_gateway_firewall_rules",
+        new_callable=AsyncMock,
+    )
+    patcher.start()
+    yield patcher
+    patcher.stop()
+
+
 @pytest.fixture
 async def coresys(
-    docker,
-    dbus_session_bus,
+    docker: DockerAPI,
+    dbus_session_bus: MessageBus,
     all_dbus_services,
     aiohttp_client,
     run_supervisor_state,
@@ -402,7 +516,7 @@ async def coresys(
     coresys_obj._config.save_data = AsyncMock()
     coresys_obj._jobs.save_data = AsyncMock()
     coresys_obj._resolution.save_data = AsyncMock()
-    coresys_obj._addons.data.save_data = AsyncMock()
+    coresys_obj._apps.data.save_data = AsyncMock()
     coresys_obj._store.save_data = AsyncMock()
     coresys_obj._mounts.save_data = AsyncMock()
 
@@ -411,8 +525,9 @@ async def coresys(
         "Config": {"Labels": {"io.hass.arch": "amd64"}},
         "HostConfig": {"Privileged": True},
     }
-    coresys_obj.arch._default_arch = "amd64"
-    coresys_obj.arch._supported_set = {"amd64"}
+    coresys_obj.arch._default_arch = CpuArch.AMD64
+    coresys_obj.arch._supported_arch = [CpuArch.AMD64]
+    coresys_obj.arch._supported_set = {CpuArch.AMD64}
     coresys_obj._machine = "qemux86-64"
     coresys_obj._machine_id = uuid4()
 
@@ -427,38 +542,34 @@ async def coresys(
     # Mock docker
     coresys_obj._docker = docker
     coresys_obj.docker.coresys = coresys_obj
-    coresys_obj.docker._monitor = DockerMonitor(coresys_obj)
+    docker.monitor.coresys = coresys_obj
 
     # Set internet state
     coresys_obj.supervisor._connectivity = True
     coresys_obj.host.network._connectivity = True
 
     # Fix Paths
-    su_config.ADDONS_CORE = Path(
-        Path(__file__).parent.joinpath("fixtures"), "addons/core"
+    su_config.APPS_CORE = Path(Path(__file__).parent.joinpath("fixtures"), "apps/core")
+    su_config.APPS_LOCAL = Path(
+        Path(__file__).parent.joinpath("fixtures"), "apps/local"
     )
-    su_config.ADDONS_LOCAL = Path(
-        Path(__file__).parent.joinpath("fixtures"), "addons/local"
-    )
-    su_config.ADDONS_GIT = Path(
-        Path(__file__).parent.joinpath("fixtures"), "addons/git"
-    )
+    su_config.APPS_GIT = Path(Path(__file__).parent.joinpath("fixtures"), "apps/git")
     su_config.APPARMOR_DATA = Path(
         Path(__file__).parent.joinpath("fixtures"), "apparmor"
     )
 
-    # WebSocket
+    # Home Assistant Core API
     coresys_obj.homeassistant.api.get_api_state = AsyncMock(
         return_value=APIState("RUNNING", False)
     )
-    coresys_obj.homeassistant._websocket._client = AsyncMock(
+    coresys_obj.homeassistant._websocket.client = AsyncMock(
         ha_version=AwesomeVersion("2021.2.4")
     )
 
     if not request.node.get_closest_marker("no_mock_init_websession"):
         coresys_obj.init_websession = AsyncMock()
 
-    # Don't remove files/folders related to addons and stores
+    # Don't remove files/folders related to apps and stores
     with patch("supervisor.store.git.GitRepo.remove"):
         yield coresys_obj
 
@@ -471,7 +582,7 @@ async def ha_ws_client(coresys: CoreSys) -> AsyncMock:
     # Set Supervisor Core state to RUNNING, otherwise WS events won't be delivered
     await coresys.core.set_state(CoreState.RUNNING)
     await asyncio.sleep(0)
-    client = coresys.homeassistant.websocket._client
+    client = coresys.homeassistant.websocket.client
     client.async_send_command.reset_mock()
     return client
 
@@ -492,8 +603,8 @@ async def tmp_supervisor_data(coresys: CoreSys, tmp_path: Path) -> Path:
         coresys.config.path_audio.mkdir()
         coresys.config.path_dns.mkdir()
         coresys.config.path_share.mkdir()
-        coresys.config.path_addons_data.mkdir(parents=True)
-        coresys.config.path_addon_configs.mkdir(parents=True)
+        coresys.config.path_apps_data.mkdir(parents=True)
+        coresys.config.path_app_configs.mkdir(parents=True)
         coresys.config.path_ssl.mkdir()
         coresys.config.path_core_backup.mkdir(parents=True)
         coresys.config.path_cid_files.mkdir()
@@ -573,9 +684,9 @@ async def api_client(
 
     @web.middleware
     async def _security_middleware(request: web.Request, handler: web.RequestHandler):
-        """Make request are from Core or specified add-on."""
+        """Make request are from Core or specified app."""
         if request_from:
-            request[REQUEST_FROM] = coresys.addons.get(request_from, local_only=True)
+            request[REQUEST_FROM] = coresys.apps.get(request_from, local_only=True)
         else:
             request[REQUEST_FROM] = coresys.homeassistant
 
@@ -585,32 +696,37 @@ async def api_client(
     api.webapp = web.Application(middlewares=[_security_middleware])
     api.start = AsyncMock()
     await api.load()
-    yield await aiohttp_client(api.webapp)
+    return await aiohttp_client(api.webapp)
 
 
 @pytest.fixture
-def supervisor_internet(coresys: CoreSys) -> Generator[AsyncMock]:
+def supervisor_internet(coresys: CoreSys) -> AsyncMock:
     """Fixture which simluate Supervsior internet connection."""
     connectivity_check = AsyncMock(return_value=True)
-    coresys.supervisor.check_connectivity = connectivity_check
-    yield connectivity_check
+    coresys.supervisor.check_and_update_connectivity = connectivity_check
+    return connectivity_check
 
 
 @pytest.fixture
-def websession(coresys: CoreSys) -> Generator[MagicMock]:
-    """Fixture for global aiohttp SessionClient."""
+def websession(coresys: CoreSys) -> MagicMock:
+    """Fixture for global aiohttp SessionClient.
+
+    Also mocks Core container is_running to return True so that
+    make_request doesn't bail before reaching the websession.
+    """
     coresys._websession = MagicMock(spec_set=ClientSession)
-    yield coresys._websession
+    coresys.homeassistant.core.instance.is_running = AsyncMock(return_value=True)
+    return coresys._websession
 
 
 @pytest.fixture
-def mock_update_data(websession: MagicMock) -> Generator[MockResponse]:
+def mock_update_data(websession: MagicMock) -> MockResponse:
     """Mock updater JSON data."""
     version_data = load_fixture("version_stable.json")
     client_response = MockResponse(text=version_data)
     client_response.status = 200
     websession.get = MagicMock(return_value=client_response)
-    yield client_response
+    return client_response
 
 
 @pytest.fixture
@@ -633,22 +749,22 @@ def run_supervisor_state(request: pytest.FixtureRequest) -> Generator[MagicMock]
 
 
 @pytest.fixture
-def store_addon(coresys: CoreSys, tmp_path, test_repository):
-    """Store add-on fixture."""
-    addon_obj = AddonStore(coresys, "test_store_addon")
+def store_app(coresys: CoreSys, tmp_path, test_repository):
+    """Store app fixture."""
+    app_obj = AppStore(coresys, "test_store_addon")
 
-    coresys.addons.store[addon_obj.slug] = addon_obj
-    coresys.store.data.addons[addon_obj.slug] = SCHEMA_ADDON_SYSTEM(
-        load_json_fixture("add-on.json")
+    coresys.apps.store[app_obj.slug] = app_obj
+    coresys.store.data.apps[app_obj.slug] = SCHEMA_APP_SYSTEM(
+        load_json_fixture("app.json")
     )
-    coresys.store.data.addons[addon_obj.slug]["location"] = tmp_path
-    yield addon_obj
+    coresys.store.data.apps[app_obj.slug]["location"] = tmp_path
+    return app_obj
 
 
 @pytest.fixture
 async def test_repository(coresys: CoreSys):
-    """Test add-on store repository fixture."""
-    coresys.config._data[ATTR_ADDONS_CUSTOM_LIST] = []
+    """Test app store repository fixture."""
+    coresys.config._data[ATTR_APPS_CUSTOM_LIST] = []
 
     with (
         patch("supervisor.store.git.GitRepo.load", return_value=None),
@@ -668,27 +784,27 @@ async def test_repository(coresys: CoreSys):
 
 
 @pytest.fixture
-async def install_addon_ssh(coresys: CoreSys, test_repository):
-    """Install local_ssh add-on."""
-    store = coresys.addons.store[TEST_ADDON_SLUG]
-    await coresys.addons.data.install(store)
-    coresys.addons.data._data = coresys.addons.data._schema(coresys.addons.data._data)
+async def install_app_ssh(coresys: CoreSys, test_repository):
+    """Install local_ssh app."""
+    store = coresys.apps.store[TEST_ADDON_SLUG]
+    await coresys.apps.data.install(store)
+    coresys.apps.data._data = coresys.apps.data._schema(coresys.apps.data._data)
 
-    addon = Addon(coresys, store.slug)
-    coresys.addons.local[addon.slug] = addon
-    yield addon
+    app = App(coresys, store.slug)
+    coresys.apps.local[app.slug] = app
+    return app
 
 
 @pytest.fixture
-async def install_addon_example(coresys: CoreSys, test_repository):
-    """Install local_example add-on."""
-    store = coresys.addons.store["local_example"]
-    await coresys.addons.data.install(store)
-    coresys.addons.data._data = coresys.addons.data._schema(coresys.addons.data._data)
+async def install_app_example(coresys: CoreSys, test_repository):
+    """Install local_example app."""
+    store = coresys.apps.store["local_example"]
+    await coresys.apps.data.install(store)
+    coresys.apps.data._data = coresys.apps.data._schema(coresys.apps.data._data)
 
-    addon = Addon(coresys, store.slug)
-    coresys.addons.local[addon.slug] = addon
-    yield addon
+    app = App(coresys, store.slug)
+    coresys.apps.local[app.slug] = app
+    return app
 
 
 @pytest.fixture
@@ -715,7 +831,7 @@ async def mock_full_backup(coresys: CoreSys, tmp_path) -> Backup:
         ATTR_EXCLUDE_DATABASE: False,
     }
     coresys.backups._backups = {"test": mock_backup}
-    yield mock_backup
+    return mock_backup
 
 
 @pytest.fixture
@@ -742,7 +858,7 @@ async def mock_partial_backup(coresys: CoreSys, tmp_path) -> Backup:
         ATTR_EXCLUDE_DATABASE: False,
     }
     coresys.backups._backups = {"test": mock_backup}
-    yield mock_backup
+    return mock_backup
 
 
 @pytest.fixture
@@ -753,7 +869,7 @@ async def backups(
     for i in range(request.param if hasattr(request, "param") else 5):
         slug = f"sn{i + 1}"
         temp_tar = Path(tmp_path, f"{slug}.tar")
-        with SecureTarFile(temp_tar, "w"):
+        with SecureTarArchive(temp_tar, "w"):
             pass
         backup = Backup(coresys, temp_tar, slug, None)
         backup._data = {  # pylint: disable=protected-access
@@ -765,7 +881,7 @@ async def backups(
         }
         coresys.backups._backups[backup.slug] = backup
 
-    yield coresys.backups.list_backups
+    return coresys.backups.list_backups
 
 
 @pytest.fixture
@@ -786,12 +902,11 @@ async def journald_logs(coresys: CoreSys) -> MagicMock:
 
 
 @pytest.fixture
-async def docker_logs(docker: DockerAPI, supervisor_name) -> MagicMock:
+async def docker_logs(container: DockerContainer, supervisor_name) -> AsyncMock:
     """Mock log output for a container from docker."""
-    container_mock = MagicMock()
-    container_mock.logs.return_value = load_binary_fixture("logs_docker_container.txt")
-    docker.containers.get.return_value = container_mock
-    yield container_mock.logs
+    logs = load_fixture("logs_docker_container.txt")
+    container.log.return_value = logs.splitlines()
+    return container.log
 
 
 @pytest.fixture
@@ -804,6 +919,16 @@ async def capture_exception() -> Mock:
         ) as capture_exception,
     ):
         yield capture_exception
+
+
+@pytest.fixture
+async def capture_message() -> Mock:
+    """Mock capture message method for testing."""
+    with (
+        patch("supervisor.utils.sentry.sentry_sdk.is_initialized", return_value=True),
+        patch("supervisor.utils.sentry.sentry_sdk.capture_message") as capture_message,
+    ):
+        yield capture_message
 
 
 @pytest.fixture
@@ -821,55 +946,99 @@ async def os_available(request: pytest.FixtureRequest) -> None:
         yield
 
 
-@pytest.fixture
-async def mount_propagation(docker: DockerAPI, coresys: CoreSys) -> None:
-    """Mock supervisor connected to container with propagation set."""
-    docker.containers.get.return_value = supervisor = MagicMock()
-    supervisor.attrs = {
-        "Mounts": [
-            {
-                "Type": "bind",
-                "Source": "/mnt/data/supervisor",
-                "Destination": "/data",
-                "Mode": "rw",
-                "RW": True,
-                "Propagation": "slave",
-            }
-        ]
-    }
-    await coresys.supervisor.load()
-    yield
+def create_mock_exec_stream(output: bytes = b"") -> AsyncMock:
+    """Create a mock stream for exec with detach=False."""
+    stream = AsyncMock()
+    # Set up async context manager
+    stream.__aenter__.return_value = stream
+    stream.__aexit__.return_value = None
+    # Set up read_out to return messages then None (EOF)
+    if output:
+        Message = type("Message", (), {"data": output})
+        stream.read_out.side_effect = [Message(), None]
+    else:
+        stream.read_out.return_value = None
+    return stream
 
 
 @pytest.fixture
-async def container(docker: DockerAPI) -> MagicMock:
+async def container(docker: DockerAPI) -> DockerContainer:
     """Mock attrs and status for container on attach."""
-    docker.containers.get.return_value = addon = MagicMock()
-    docker.containers.create.return_value = addon
-    addon.status = "stopped"
-    addon.attrs = {"State": {"ExitCode": 0}}
-    yield addon
+    container_mock = docker.containers.get.return_value
+
+    # Set up exec mock to return a mock stream
+    # Note: This must be a regular function, not async, to match aiodocker's start() behavior
+    def mock_exec_start(detach=False):
+        if detach:
+            # Old behavior for detach=True (shouldn't be used anymore)
+            # Would need to return an awaitable
+            async def _async_start():
+                return b""
+
+            return _async_start()
+        # Return mock stream for detach=False (synchronous)
+        return create_mock_exec_stream(output=b"")
+
+    # Replace the mock's start method with a MagicMock (not AsyncMock)
+    start_mock = MagicMock(side_effect=mock_exec_start)
+    container_mock.exec.return_value.start = start_mock
+
+    # Store the original side_effect so tests can override it but we can restore if needed
+    start_mock._original_side_effect = mock_exec_start
+
+    container_mock.exec.return_value.inspect.return_value = {
+        "Running": False,
+        "ExitCode": 0,
+        "Pid": 12345,
+    }
+
+    return container_mock
+
+
+@pytest.fixture
+async def mount_propagation(container: DockerContainer, coresys: CoreSys) -> None:
+    """Mock supervisor connected to container with propagation set."""
+    container.show.return_value["Mounts"] = [
+        {
+            "Type": "bind",
+            "Source": "/mnt/data/supervisor",
+            "Destination": "/data",
+            "Mode": "rw",
+            "RW": True,
+            "Propagation": "slave",
+        }
+    ]
+    await coresys.supervisor.load()
 
 
 @pytest.fixture
 def mock_amd64_arch_supported(coresys: CoreSys) -> None:
     """Mock amd64 arch as supported."""
-    coresys.arch._supported_arch = ["amd64"]
-    coresys.arch._supported_set = {"amd64"}
+    coresys.arch._supported_arch = [CpuArch.AMD64]
+    coresys.arch._supported_set = {CpuArch.AMD64}
 
 
 @pytest.fixture
 def mock_aarch64_arch_supported(coresys: CoreSys) -> None:
     """Mock aarch64 arch as supported."""
-    coresys.arch._supported_arch = ["amd64"]
-    coresys.arch._supported_set = {"amd64"}
+    coresys.arch._supported_arch = [CpuArch.AMD64]
+    coresys.arch._supported_set = {CpuArch.AMD64}
 
 
 @pytest.fixture
 def mock_is_mount() -> MagicMock:
-    """Mock is_mount in mounts."""
-    with patch("supervisor.mounts.mount.Path.is_mount", return_value=True) as is_mount:
-        yield is_mount
+    """Mock the network-mount probe to report a healthy mount.
+
+    Patches `_probe_network_mount` (the executor-side syscall combo
+    of statvfs + st_dev comparison) so existing tests don't need a
+    real filesystem mount to look healthy. Tests that simulate a
+    broken mount override with `side_effect=OSError(...)` for the
+    unreachable case or `return_value=False` for the ghost case.
+    """
+    with patch(
+        "supervisor.mounts.mount._probe_network_mount", return_value=True
+    ) as probe:
+        yield probe
 
 
 @pytest.fixture

@@ -60,7 +60,7 @@ class Resolved(DBusInterfaceProxy):
             await super().connect(bus)
         except DBusError:
             _LOGGER.warning("Can't connect to systemd-resolved.")
-        except (DBusServiceUnkownError, DBusInterfaceError):
+        except DBusServiceUnkownError, DBusInterfaceError:
             _LOGGER.warning(
                 "Host has no systemd-resolved support. DNS will not work correctly."
             )
@@ -75,7 +75,7 @@ class Resolved(DBusInterfaceProxy):
     @dbus_property
     def current_dns_server(
         self,
-    ) -> list[tuple[int, DNSAddressFamily, bytes]] | None:
+    ) -> tuple[int, DNSAddressFamily, bytes] | None:
         """Return current DNS server."""
         return self.properties[DBUS_ATTR_CURRENT_DNS_SERVER]
 
@@ -83,7 +83,7 @@ class Resolved(DBusInterfaceProxy):
     @dbus_property
     def current_dns_server_ex(
         self,
-    ) -> list[tuple[int, DNSAddressFamily, bytes, int, str]] | None:
+    ) -> tuple[int, DNSAddressFamily, bytes, int, str] | None:
         """Return current DNS server including port and server name."""
         return self.properties[DBUS_ATTR_CURRENT_DNS_SERVER_EX]
 
@@ -103,19 +103,19 @@ class Resolved(DBusInterfaceProxy):
     @dbus_property
     def dns_over_tls(self) -> DNSOverTLSEnabled | None:
         """Return DNS over TLS enabled."""
-        return self.properties[DBUS_ATTR_DNS_OVER_TLS]
+        return DNSOverTLSEnabled(self.properties[DBUS_ATTR_DNS_OVER_TLS])
 
     @property
     @dbus_property
     def dns_stub_listener(self) -> DNSStubListenerEnabled | None:
         """Return DNS stub listener enabled on port 53."""
-        return self.properties[DBUS_ATTR_DNS_STUB_LISTENER]
+        return DNSStubListenerEnabled(self.properties[DBUS_ATTR_DNS_STUB_LISTENER])
 
     @property
     @dbus_property
     def dnssec(self) -> DNSSECValidation | None:
         """Return DNSSEC validation enforced."""
-        return self.properties[DBUS_ATTR_DNSSEC]
+        return DNSSECValidation(self.properties[DBUS_ATTR_DNSSEC])
 
     @property
     @dbus_property
@@ -159,7 +159,7 @@ class Resolved(DBusInterfaceProxy):
     @dbus_property
     def llmnr(self) -> MulticastProtocolEnabled | None:
         """Return LLMNR enabled."""
-        return self.properties[DBUS_ATTR_LLMNR]
+        return MulticastProtocolEnabled(self.properties[DBUS_ATTR_LLMNR])
 
     @property
     @dbus_property
@@ -171,13 +171,13 @@ class Resolved(DBusInterfaceProxy):
     @dbus_property
     def multicast_dns(self) -> MulticastProtocolEnabled | None:
         """Return MDNS enabled."""
-        return self.properties[DBUS_ATTR_MULTICAST_DNS]
+        return MulticastProtocolEnabled(self.properties[DBUS_ATTR_MULTICAST_DNS])
 
     @property
     @dbus_property
     def resolv_conf_mode(self) -> ResolvConfMode | None:
         """Return how /etc/resolv.conf managed on host."""
-        return self.properties[DBUS_ATTR_RESOLV_CONF_MODE]
+        return ResolvConfMode(self.properties[DBUS_ATTR_RESOLV_CONF_MODE])
 
     @property
     @dbus_property

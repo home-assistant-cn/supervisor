@@ -7,8 +7,7 @@ from typing import Any
 
 from dbus_fast.aio.message_bus import MessageBus
 
-from supervisor.exceptions import DBusInterfaceError, DBusNotConnectedError
-
+from ..exceptions import DBusInterfaceError, DBusNotConnectedError
 from ..utils.dbus import DBus
 from .utils import dbus_connected
 
@@ -20,7 +19,7 @@ def dbus_property(func):
     def wrapper(*args, **kwds):
         try:
             return func(*args, **kwds)
-        except (KeyError, AttributeError):
+        except KeyError, AttributeError:
             return None
 
     return wrapper
@@ -57,7 +56,7 @@ class DBusInterface(ABC):
     def connected_dbus(self) -> DBus:
         """Return dbus object. Raise if not connected."""
         if not self.dbus:
-            raise DBusNotConnectedError()
+            raise DBusNotConnectedError
         return self.dbus
 
     async def connect(self, bus: MessageBus) -> None:

@@ -8,12 +8,12 @@ import queue
 from typing import Any
 
 
-class AddonLoggerAdapter(logging.LoggerAdapter):
-    """Logging Adapter which prepends log entries with add-on name."""
+class AppLoggerAdapter(logging.LoggerAdapter):
+    """Logging Adapter which prepends log entries with app name."""
 
     def process(self, msg, kwargs):
-        """Process the logging message by prepending the add-on name."""
-        return f"[{self.extra['addon_name']}] {msg}", kwargs
+        """Process the logging message by prepending the app name."""
+        return f"[{self.extra['app_name']}] {msg}", kwargs
 
 
 class SupervisorQueueHandler(logging.handlers.QueueHandler):

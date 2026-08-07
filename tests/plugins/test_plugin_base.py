@@ -1,9 +1,8 @@
 """Test base plugin functionality."""
 
-import asyncio
-from pathlib import Path
-from unittest.mock import ANY, MagicMock, Mock, PropertyMock, call, patch
+from unittest.mock import ANY, Mock, PropertyMock, call, patch
 
+from aiodocker.containers import DockerContainer
 from awesomeversion import AwesomeVersion
 import pytest
 
@@ -35,6 +34,8 @@ from supervisor.plugins.dns import PluginDns
 from supervisor.plugins.multicast import PluginMulticast
 from supervisor.plugins.observer import PluginObserver
 from supervisor.utils import check_exception_chain
+
+from tests.common import fire_bus_event
 
 
 @pytest.fixture(name="plugin")
@@ -74,7 +75,8 @@ async def test_plugin_watchdog(coresys: CoreSys, plugin: PluginBase) -> None:
         patch.object(type(plugin.instance), "current_state") as current_state,
     ):
         current_state.return_value = ContainerState.UNHEALTHY
-        coresys.bus.fire_event(
+        await fire_bus_event(
+            coresys,
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
                 name=plugin.instance.name,
@@ -83,29 +85,30 @@ async def test_plugin_watchdog(coresys: CoreSys, plugin: PluginBase) -> None:
                 time=1,
             ),
         )
-        await asyncio.sleep(0)
         rebuild.assert_called_once()
         start.assert_not_called()
 
         rebuild.reset_mock()
         current_state.return_value = ContainerState.FAILED
-        coresys.bus.fire_event(
+        await fire_bus_event(
+            coresys,
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
                 name=plugin.instance.name,
                 state=ContainerState.FAILED,
                 id="abc123",
                 time=1,
+                exit_code=1,
             ),
         )
-        await asyncio.sleep(0)
         rebuild.assert_called_once()
         start.assert_not_called()
 
         rebuild.reset_mock()
         # Stop should be ignored as it means an update or system shutdown, plugins don't stop otherwise
         current_state.return_value = ContainerState.STOPPED
-        coresys.bus.fire_event(
+        await fire_bus_event(
+            coresys,
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
                 name=plugin.instance.name,
@@ -114,42 +117,42 @@ async def test_plugin_watchdog(coresys: CoreSys, plugin: PluginBase) -> None:
                 time=1,
             ),
         )
-        await asyncio.sleep(0)
         rebuild.assert_not_called()
         start.assert_not_called()
 
         # Do not process event if container state has changed since fired
         current_state.return_value = ContainerState.HEALTHY
-        coresys.bus.fire_event(
+        await fire_bus_event(
+            coresys,
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
                 name=plugin.instance.name,
                 state=ContainerState.FAILED,
                 id="abc123",
                 time=1,
+                exit_code=1,
             ),
         )
-        await asyncio.sleep(0)
         rebuild.assert_not_called()
         start.assert_not_called()
 
         # Other containers ignored
-        coresys.bus.fire_event(
+        await fire_bus_event(
+            coresys,
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
-                name="addon_local_other",
+                name="app_local_other",
                 state=ContainerState.UNHEALTHY,
                 id="abc123",
                 time=1,
             ),
         )
-        await asyncio.sleep(0)
         rebuild.assert_not_called()
         start.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "plugin,error",
+    ("plugin", "error"),
     [
         (PluginAudio, AudioError()),
         (PluginCli, CliError()),
@@ -159,22 +162,21 @@ async def test_plugin_watchdog(coresys: CoreSys, plugin: PluginBase) -> None:
     ],
     indirect=["plugin"],
 )
+@pytest.mark.usefixtures("coresys", "tmp_supervisor_data", "path_extern")
 async def test_plugin_watchdog_max_failed_attempts(
-    coresys: CoreSys,
     capture_exception: Mock,
     plugin: PluginBase,
     error: PluginError,
-    container: MagicMock,
+    container: DockerContainer,
     caplog: pytest.LogCaptureFixture,
-    tmp_supervisor_data: Path,
-    path_extern,
 ) -> None:
     """Test plugin watchdog gives up after max failed attempts."""
     with patch.object(type(plugin.instance), "attach"):
         await plugin.load()
 
-    container.status = "stopped"
-    container.attrs = {"State": {"ExitCode": 1}}
+    container.show.return_value["State"]["Status"] = "stopped"
+    container.show.return_value["State"]["Running"] = False
+    container.show.return_value["State"]["ExitCode"] = 1
     with (
         patch("supervisor.plugins.base.WATCHDOG_RETRY_SECONDS", 0),
         patch.object(type(plugin), "start", side_effect=error) as start,
@@ -185,6 +187,7 @@ async def test_plugin_watchdog_max_failed_attempts(
                 state=ContainerState.FAILED,
                 id="abc123",
                 time=1,
+                exit_code=1,
             )
         )
         assert start.call_count == 5
@@ -298,7 +301,7 @@ async def test_plugin_load_missing_container(
 
 
 @pytest.mark.parametrize(
-    "plugin,error",
+    ("plugin", "error"),
     [
         (PluginAudio, AudioJobError),
         (PluginCli, CliJobError),
@@ -328,9 +331,8 @@ async def test_update_fails_if_out_of_date(
     [PluginAudio, PluginCli, PluginDns, PluginMulticast, PluginObserver],
     indirect=True,
 )
-async def test_repair_failed(
-    coresys: CoreSys, capture_exception: Mock, plugin: PluginBase
-):
+@pytest.mark.usefixtures("coresys")
+async def test_repair_failed(capture_exception: Mock, plugin: PluginBase):
     """Test repair failed."""
     with (
         patch.object(DockerInterface, "exists", return_value=False),
@@ -351,7 +353,7 @@ async def test_repair_failed(
     indirect=True,
 )
 async def test_load_with_incorrect_image(
-    coresys: CoreSys, container: MagicMock, plugin: PluginBase
+    coresys: CoreSys, container: DockerContainer, plugin: PluginBase
 ):
     """Test plugin loads with the incorrect image."""
     plugin.image = old_image = f"ghcr.io/home-assistant/aarch64-hassio-{plugin.slug}"
@@ -359,20 +361,21 @@ async def test_load_with_incorrect_image(
     coresys.updater._data["image"][plugin.slug] = correct_image  # pylint: disable=protected-access
     plugin.version = AwesomeVersion("2024.4.0")
 
-    container.status = "running"
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
     coresys.docker.images.inspect.return_value = img_data = (
         coresys.docker.images.inspect.return_value
         | {"Config": {"Labels": {"io.hass.version": "2024.4.0"}}}
     )
-    container.attrs |= img_data
+    container.show.return_value |= img_data
 
     with patch.object(DockerAPI, "pull_image", return_value=img_data) as pull_image:
         await plugin.load()
         pull_image.assert_called_once_with(
-            ANY, correct_image, "2024.4.0", platform="linux/amd64"
+            ANY, correct_image, "2024.4.0", platform="linux/amd64", auth=None
         )
 
-    container.remove.assert_called_once_with(force=True, v=True)
+    container.delete.assert_called_once_with(force=True, v=True)
     assert coresys.docker.images.delete.call_args_list[0] == call(
         f"{old_image}:latest",
         force=True,
@@ -389,9 +392,7 @@ async def test_load_with_incorrect_image(
     [PluginAudio, PluginCli, PluginDns, PluginMulticast, PluginObserver],
     indirect=True,
 )
-async def test_default_image_fallback(
-    coresys: CoreSys, container: MagicMock, plugin: PluginBase
-):
+async def test_default_image_fallback(coresys: CoreSys, plugin: PluginBase):
     """Test default image falls back to hard-coded constant if we fail to fetch version file."""
     assert getattr(coresys.updater, f"image_{plugin.slug}") is None
     assert plugin.default_image == f"ghcr.io/home-assistant/amd64-hassio-{plugin.slug}"

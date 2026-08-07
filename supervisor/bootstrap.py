@@ -3,17 +3,17 @@
 # ruff: noqa: T100
 import asyncio
 from collections.abc import Callable
-from importlib import import_module
 import logging
 import os
 import signal
+import threading
 import warnings
 
 from colorlog import ColoredFormatter
 
-from .addons.manager import AddonManager
 from .api import RestAPI
-from .arch import CpuArch
+from .apps.manager import AppManager
+from .arch import CpuArchManager
 from .auth import Auth
 from .backups.manager import BackupManager
 from .bus import Bus
@@ -61,6 +61,7 @@ async def initialize_coresys() -> CoreSys:
         _LOGGER.warning("Environment variable 'SUPERVISOR_DEV' is set")
         coresys.config.logging = LogLevel.DEBUG
         coresys.config.debug = True
+        coresys.config.detect_blocking_io = True
     else:
         coresys.config.modify_log_level()
 
@@ -71,13 +72,13 @@ async def initialize_coresys() -> CoreSys:
     coresys.jobs = await JobManager(coresys).load_config()
     coresys.core = await Core(coresys).post_init()
     coresys.plugins = await PluginManager(coresys).load_config()
-    coresys.arch = CpuArch(coresys)
+    coresys.arch = CpuArchManager(coresys)
     coresys.auth = await Auth(coresys).load_config()
     coresys.updater = await Updater(coresys).load_config()
     coresys.api = RestAPI(coresys)
     coresys.supervisor = Supervisor(coresys)
     coresys.homeassistant = await HomeAssistant(coresys).load_config()
-    coresys.addons = await AddonManager(coresys).load_config()
+    coresys.apps = await AppManager(coresys).load_config()
     coresys.backups = await BackupManager(coresys).load_config()
     coresys.host = await HostManager(coresys).post_init()
     coresys.hardware = await HardwareManager.create(coresys)
@@ -101,7 +102,12 @@ async def initialize_coresys() -> CoreSys:
         init_sentry(coresys)
 
     # bootstrap config
-    initialize_system(coresys)
+    def _bootstrap_config() -> None:
+        """Bootstrap config."""
+        _migrate_legacy_paths(coresys)
+        initialize_system(coresys)
+
+    await coresys.run_in_executor(_bootstrap_config)
 
     if coresys.dev:
         coresys.updater.channel = UpdateChannel.DEV
@@ -110,6 +116,44 @@ async def initialize_coresys() -> CoreSys:
     logging.Formatter.converter = lambda *args: coresys.now().timetuple()
 
     return coresys
+
+
+def _migrate_legacy_paths(coresys: CoreSys) -> None:
+    """Rename legacy addon directories and config file to new app paths."""
+    config = coresys.config
+    supervisor = config.path_supervisor
+
+    # Migrate addons/{core,data,local,git} -> apps/{core,data,local,git}
+    apps_dir = supervisor / "apps"
+    migrations = [
+        (supervisor / "addons" / "core", config.path_apps_core),
+        (supervisor / "addons" / "data", config.path_apps_data),
+        (supervisor / "addons" / "local", config.path_apps_local),
+        (supervisor / "addons" / "git", config.path_apps_git),
+        (supervisor / "addon_configs", config.path_app_configs),
+    ]
+    needs_apps_dir = any(
+        old.is_dir() and not new.exists()
+        for old, new in migrations[:4]  # only the apps/ sub-dirs
+    )
+    if needs_apps_dir and not apps_dir.is_dir():
+        apps_dir.mkdir(parents=True)
+
+    for old, new in migrations:
+        if old.is_dir() and not new.exists():
+            _LOGGER.info("Migrating %s to %s", old, new)
+            old.rename(new)
+
+    # Opportunistic remove of the now-empty legacy addons directory.
+    # rmdir only succeeds if empty, so leftover files keep it around.
+    legacy_addons = supervisor / "addons"
+    try:
+        legacy_addons.rmdir()
+    except OSError:
+        _LOGGER.debug(
+            "Legacy addons directory '%s' not empty, leaving in place",
+            legacy_addons.as_posix(),
+        )
 
 
 def initialize_system(coresys: CoreSys) -> None:
@@ -129,26 +173,26 @@ def initialize_system(coresys: CoreSys) -> None:
         _LOGGER.debug("Creating Supervisor SSL/TLS folder at '%s'", config.path_ssl)
         config.path_ssl.mkdir()
 
-    # Supervisor addon data folder
-    if not config.path_addons_data.is_dir():
+    # Supervisor app data folder
+    if not config.path_apps_data.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor Add-on data folder at '%s'", config.path_addons_data
+            "Creating Supervisor app data folder at '%s'", config.path_apps_data
         )
-        config.path_addons_data.mkdir(parents=True)
+        config.path_apps_data.mkdir(parents=True)
 
-    if not config.path_addons_local.is_dir():
+    if not config.path_apps_local.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor Add-on local repository folder at '%s'",
-            config.path_addons_local,
+            "Creating Supervisor app local repository folder at '%s'",
+            config.path_apps_local,
         )
-        config.path_addons_local.mkdir(parents=True)
+        config.path_apps_local.mkdir(parents=True)
 
-    if not config.path_addons_git.is_dir():
+    if not config.path_apps_git.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor Add-on git repositories folder at '%s'",
-            config.path_addons_git,
+            "Creating Supervisor app git repositories folder at '%s'",
+            config.path_apps_git,
         )
-        config.path_addons_git.mkdir(parents=True)
+        config.path_apps_git.mkdir(parents=True)
 
     # Supervisor tmp folder
     if not config.path_tmp.is_dir():
@@ -218,13 +262,13 @@ def initialize_system(coresys: CoreSys) -> None:
         )
         config.path_emergency.mkdir()
 
-    # Addon Configs folder
-    if not config.path_addon_configs.is_dir():
+    # App Configs folder
+    if not config.path_app_configs.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor add-on configs folder at '%s'",
-            config.path_addon_configs,
+            "Creating Supervisor app configs folder at '%s'",
+            config.path_app_configs,
         )
-        config.path_addon_configs.mkdir()
+        config.path_app_configs.mkdir()
 
     if not config.path_cid_files.is_dir():
         _LOGGER.debug("Creating Docker cidfiles folder at '%s'", config.path_cid_files)
@@ -235,6 +279,11 @@ def warning_handler(message, category, filename, lineno, file=None, line=None):
     """Warning handler which logs warnings using the logging module."""
     _LOGGER.warning("%s:%s: %s: %s", filename, lineno, category.__name__, message)
     if isinstance(message, Exception):
+        # Don't capture warnings originating from Sentry SDK threads to
+        # avoid a feedback loop: sending an event can trigger urllib3
+        # warnings which would be captured and sent as new events.
+        if threading.current_thread().name.startswith("sentry-sdk."):
+            return
         capture_exception(message)
 
 
@@ -295,17 +344,17 @@ def register_signal_handlers(
     """Register SIGTERM, SIGHUP and SIGKILL to stop the Supervisor."""
     try:
         loop.add_signal_handler(signal.SIGTERM, shutdown_handler)
-    except (ValueError, RuntimeError):
+    except ValueError, RuntimeError:
         _LOGGER.warning("Could not bind to SIGTERM")
 
     try:
         loop.add_signal_handler(signal.SIGHUP, shutdown_handler)
-    except (ValueError, RuntimeError):
+    except ValueError, RuntimeError:
         _LOGGER.warning("Could not bind to SIGHUP")
 
     try:
         loop.add_signal_handler(signal.SIGINT, shutdown_handler)
-    except (ValueError, RuntimeError):
+    except ValueError, RuntimeError:
         _LOGGER.warning("Could not bind to SIGINT")
 
 
@@ -314,11 +363,15 @@ async def supervisor_debugger(coresys: CoreSys) -> None:
     if not coresys.config.debug:
         return
 
-    debugpy = await coresys.run_in_executor(import_module, "debugpy")
+    def setup_debugger() -> None:
+        # pylint: disable-next=import-outside-toplevel
+        import debugpy  # noqa: PLC0415
 
-    _LOGGER.info("Initializing Supervisor debugger")
+        _LOGGER.info("Initializing Supervisor debugger")
 
-    debugpy.listen(("0.0.0.0", 33333))
-    if coresys.config.debug_block:
-        _LOGGER.info("Wait until debugger is attached")
-        debugpy.wait_for_client()
+        debugpy.listen(("0.0.0.0", 33333))
+        if coresys.config.debug_block:
+            _LOGGER.info("Wait until debugger is attached")
+            debugpy.wait_for_client()
+
+    await coresys.run_in_executor(setup_debugger)

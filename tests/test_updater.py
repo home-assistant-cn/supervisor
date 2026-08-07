@@ -67,7 +67,7 @@ async def test_fetch_versions(
 
 @pytest.mark.usefixtures("no_job_throttle")
 @pytest.mark.parametrize(
-    "version, expected",
+    ("version", "expected"),
     [
         ("3.1", "3.13"),
         ("4.5", "4.20"),
@@ -84,7 +84,7 @@ async def test_os_update_path(
     supervisor_internet: AsyncMock,
 ):
     """Test OS upgrade path across major versions."""
-    coresys.os._board = "rpi4"  # pylint: disable=protected-access
+    coresys.os._board = "rpi4-64"  # pylint: disable=protected-access
     coresys.os._version = AwesomeVersion(version)  # pylint: disable=protected-access
     await coresys.updater.fetch_data()
 
@@ -116,7 +116,7 @@ async def test_delayed_fetch_for_connectivity(
     coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_START, find_fetch_data_job_start)
 
     # Start with no connectivity and confirm there is no version fetch on load
-    coresys.supervisor.connectivity = False
+    coresys.supervisor._connectivity = False  # pylint: disable=protected-access
     network_manager_service.connectivity = ConnectivityState.CONNECTIVITY_NONE.value
     await coresys.host.network.load()
     await coresys.host.network.check_connectivity()
@@ -147,7 +147,7 @@ async def test_load_calls_reload_when_os_board_without_version(
 ) -> None:
     """Test load calls reload when OS board exists but no version_hassos_unrestricted."""
     # Set up OS board but no version data
-    coresys.os._board = "rpi4"  # pylint: disable=protected-access
+    coresys.os._board = "rpi4-64"  # pylint: disable=protected-access
     coresys.security.force = True
 
     # Mock reload to verify it gets called
@@ -162,7 +162,7 @@ async def test_load_skips_reload_when_os_board_with_version(
 ) -> None:
     """Test load skips reload when OS board exists and version_hassos_unrestricted is set."""
     # Set up OS board and version data
-    coresys.os._board = "rpi4"  # pylint: disable=protected-access
+    coresys.os._board = "rpi4-64"  # pylint: disable=protected-access
     coresys.security.force = True
 
     # Pre-populate version_hassos_unrestricted by setting it directly on the data dict
@@ -201,7 +201,7 @@ async def test_fetch_data_no_update_when_os_unsupported(
     coresys.websession.head = AsyncMock()
 
     # Mark OS as unsupported by adding UnsupportedReason.OS_VERSION
-    coresys.resolution.unsupported.append(UnsupportedReason.OS_VERSION)
+    coresys.resolution.unsupported.add(UnsupportedReason.OS_VERSION)
 
     # Attempt to fetch data should fail due to OS_SUPPORTED condition
     with pytest.raises(

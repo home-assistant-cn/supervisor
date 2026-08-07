@@ -1,6 +1,7 @@
 """Tools file for Supervisor."""
 
 import asyncio
+import errno
 from functools import lru_cache
 from ipaddress import IPv4Address
 import logging
@@ -10,7 +11,6 @@ import re
 import socket
 import subprocess
 from tempfile import TemporaryDirectory
-from typing import Any
 
 from awesomeversion import AwesomeVersion
 
@@ -19,9 +19,9 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 RE_STRING: re.Pattern = re.compile(r"\x1b(\[.*?[@-~]|\].*?(\x07|\x1b\\))")
 
 
-def convert_to_ascii(raw: bytes) -> str:
-    """Convert binary to ascii and remove colors."""
-    return RE_STRING.sub("", raw.decode())
+def remove_colors(log: str) -> str:
+    """Remove color characters from log."""
+    return RE_STRING.sub("", log)
 
 
 def process_lock(method):
@@ -48,7 +48,7 @@ async def check_port(address: IPv4Address, port: int) -> bool:
     try:
         async with asyncio.timeout(0.5):
             await asyncio.get_running_loop().sock_connect(sock, (str(address), port))
-    except (OSError, TimeoutError):
+    except OSError, TimeoutError:
         return False
     finally:
         if sock is not None:
@@ -56,18 +56,27 @@ async def check_port(address: IPv4Address, port: int) -> bool:
     return True
 
 
-def check_exception_chain(err: BaseException, object_type: Any) -> bool:
-    """Check if exception chain include sub exception.
+def check_exception_chain(
+    err: BaseException,
+    object_type: type[BaseException] | tuple[type[BaseException], ...],
+) -> bool:
+    """Check if exception chain contains the target type.
 
-    It's not full recursive because we need mostly only access to the latest.
+    Walks the __cause__ chain, which Python sets when code explicitly chains
+    exceptions via `raise B() from a`. Our codebase consistently uses that
+    pattern for re-raises, so __cause__ reliably reflects the "caused by"
+    relationship we want to match. __context__ is not used because it can
+    include unrelated in-flight exceptions from surrounding except blocks.
+
+    Not fully recursive because we mostly only need access to the latest.
     """
-    if issubclass(type(err), object_type):
+    if isinstance(err, object_type):
         return True
 
-    if not err.__context__:
+    if err.__cause__ is None:
         return False
 
-    return check_exception_chain(err.__context__, object_type)
+    return check_exception_chain(err.__cause__, object_type)
 
 
 def get_message_from_exception_chain(err: BaseException) -> str:
@@ -146,10 +155,11 @@ def get_latest_mtime(directory: Path) -> tuple[float, Path]:
             if mtime > latest_mtime:
                 latest_mtime = mtime
                 latest_path = path
-        except FileNotFoundError:
-            # File might disappear between listing and stat. Parent
-            # directory modification date will flag such a change.
-            continue
+        except OSError as err:
+            if err.errno in (errno.ENOENT, errno.ELOOP):
+                _LOGGER.debug("Could not stat %s, skipping", path)
+                continue
+            raise
     return latest_mtime, latest_path
 
 

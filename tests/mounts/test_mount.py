@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import errno
 from pathlib import Path
 import stat
 from typing import Any
@@ -28,8 +28,8 @@ ERROR_NO_UNIT = DBusError("org.freedesktop.systemd1.NoSuchUnit", "error")
 
 
 @pytest.mark.parametrize(
-    "additional_data,expected_options",
-    (
+    ("additional_data", "expected_options"),
+    [
         (
             {"version": MountCifsVersion.LEGACY_1_0},
             ["vers=1.0"],
@@ -42,7 +42,7 @@ ERROR_NO_UNIT = DBusError("org.freedesktop.systemd1.NoSuchUnit", "error")
             {"version": None},
             [],
         ),
-    ),
+    ],
 )
 async def test_cifs_mount(
     coresys: CoreSys,
@@ -84,7 +84,12 @@ async def test_cifs_mount(
     assert mount.what == "//test.local/camera"
     assert mount.where == Path("/mnt/data/supervisor/mounts/test")
     assert mount.local_where == tmp_supervisor_data / "mounts" / "test"
-    assert mount.options == ["noserverino"] + expected_options + [
+    assert mount.options == [
+        "noserverino",
+        "soft",
+        "echo_interval=10",
+        "retrans=0",
+    ] + expected_options + [
         "credentials=/mnt/data/supervisor/.mounts_credentials/test",
     ]
 
@@ -105,22 +110,28 @@ async def test_cifs_mount(
             "mnt-data-supervisor-mounts-test.mount",
             "fail",
             [
-                [
+                (
                     "Options",
                     Variant(
                         "s",
                         ",".join(
-                            ["noserverino"]
+                            [
+                                "noserverino",
+                                "soft",
+                                "echo_interval=10",
+                                "retrans=0",
+                            ]
                             + expected_options
                             + [
                                 "credentials=/mnt/data/supervisor/.mounts_credentials/test"
                             ]
                         ),
                     ),
-                ],
-                ["Type", Variant("s", "cifs")],
-                ["Description", Variant("s", "Supervisor cifs mount: test")],
-                ["What", Variant("s", "//test.local/camera")],
+                ),
+                ("Type", Variant("s", "cifs")),
+                ("Description", Variant("s", "Supervisor cifs mount: test")),
+                ("What", Variant("s", "//test.local/camera")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         )
@@ -177,10 +188,16 @@ async def test_cifs_mount_read_only(
             "mnt-data-supervisor-mounts-test.mount",
             "fail",
             [
-                ["Options", Variant("s", "ro,noserverino,guest")],
-                ["Type", Variant("s", "cifs")],
-                ["Description", Variant("s", "Supervisor cifs mount: test")],
-                ["What", Variant("s", "//test.local/camera")],
+                (
+                    "Options",
+                    Variant(
+                        "s", "ro,noserverino,soft,echo_interval=10,retrans=0,guest"
+                    ),
+                ),
+                ("Type", Variant("s", "cifs")),
+                ("Description", Variant("s", "Supervisor cifs mount: test")),
+                ("What", Variant("s", "//test.local/camera")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         )
@@ -221,7 +238,7 @@ async def test_nfs_mount(
     assert mount.what == "test.local:/media/camera"
     assert mount.where == Path("/mnt/data/supervisor/mounts/test")
     assert mount.local_where == tmp_supervisor_data / "mounts" / "test"
-    assert mount.options == ["port=1234", "soft", "timeo=200"]
+    assert mount.options == ["port=1234", "softerr", "timeo=100", "retrans=2"]
 
     assert not mount.local_where.exists()
     assert mount.to_dict() == mount_data
@@ -237,10 +254,11 @@ async def test_nfs_mount(
             "mnt-data-supervisor-mounts-test.mount",
             "fail",
             [
-                ["Options", Variant("s", "port=1234,soft,timeo=200")],
-                ["Type", Variant("s", "nfs")],
-                ["Description", Variant("s", "Supervisor nfs mount: test")],
-                ["What", Variant("s", "test.local:/media/camera")],
+                ("Options", Variant("s", "port=1234,softerr,timeo=100,retrans=2")),
+                ("Type", Variant("s", "nfs")),
+                ("Description", Variant("s", "Supervisor nfs mount: test")),
+                ("What", Variant("s", "test.local:/media/camera")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         )
@@ -283,10 +301,11 @@ async def test_nfs_mount_read_only(
             "mnt-data-supervisor-mounts-test.mount",
             "fail",
             [
-                ["Options", Variant("s", "ro,port=1234,soft,timeo=200")],
-                ["Type", Variant("s", "nfs")],
-                ["Description", Variant("s", "Supervisor nfs mount: test")],
-                ["What", Variant("s", "test.local:/media/camera")],
+                ("Options", Variant("s", "ro,port=1234,softerr,timeo=100,retrans=2")),
+                ("Type", Variant("s", "nfs")),
+                ("Description", Variant("s", "Supervisor nfs mount: test")),
+                ("What", Variant("s", "test.local:/media/camera")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         )
@@ -331,10 +350,14 @@ async def test_load(
             "mnt-data-supervisor-mounts-test.mount",
             "fail",
             [
-                ["Options", Variant("s", "noserverino,guest")],
-                ["Type", Variant("s", "cifs")],
-                ["Description", Variant("s", "Supervisor cifs mount: test")],
-                ["What", Variant("s", "//test.local/share")],
+                (
+                    "Options",
+                    Variant("s", "noserverino,soft,echo_interval=10,retrans=0,guest"),
+                ),
+                ("Type", Variant("s", "cifs")),
+                ("Description", Variant("s", "Supervisor cifs mount: test")),
+                ("What", Variant("s", "//test.local/share")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         )
@@ -368,6 +391,11 @@ async def test_load(
     ]
 
     # Load waits up to 30 seconds if it finds a unit in the activating state
+    # (the wait happens inside _update_state_await driven by PropertiesChanged).
+    # Once the state settles to FAILED, load triggers a reload, and the reload
+    # is driven to completion by the mock-emitted JobRemoved signal — which
+    # also flips active_state to "active" via mock_systemd_unit.
+    systemd_service.mock_systemd_unit = systemd_unit_service
     systemd_service.ReloadOrRestartUnit.calls.clear()
     systemd_unit_service.active_state = "activating"
     mount = Mount.from_dict(coresys, mount_data)
@@ -375,8 +403,6 @@ async def test_load(
     load_task = asyncio.create_task(mount.load())
     await asyncio.sleep(0.1)
     systemd_unit_service.emit_properties_changed({"ActiveState": "failed"})
-    await asyncio.sleep(0.1)
-    systemd_unit_service.emit_properties_changed({"ActiveState": "active"})
     await load_task
 
     assert mount.state == UnitActiveState.ACTIVE
@@ -466,16 +492,15 @@ async def test_mount_failure(
     assert len(systemd_service.StartTransientUnit.calls) == 1
     assert len(systemd_service.GetUnit.calls) == 1
 
-    # If state is 'activating', wait it out and raise error if it does not become 'active'
+    # When the post-dispatch state is not 'active' the mount call raises.
+    # With JobRemoved as the completion signal, supervisor trusts that the
+    # job is done by the time the signal fires — the systemd-side state
+    # await happens inside systemd, not in supervisor.
     systemd_service.StartTransientUnit.calls.clear()
     systemd_service.GetUnit.calls.clear()
-    systemd_unit_service.active_state = "activating"
-
-    load_task = asyncio.create_task(mount.mount())
-    await asyncio.sleep(0.1)
-    systemd_unit_service.emit_properties_changed({"ActiveState": "failed"})
+    systemd_unit_service.active_state = "failed"
     with pytest.raises(MountError):
-        await load_task
+        await mount.mount()
 
     assert mount.state == UnitActiveState.FAILED
     assert len(systemd_service.StartTransientUnit.calls) == 1
@@ -556,7 +581,12 @@ async def test_reload_failure(
         "/org/freedesktop/systemd1/job/7623"
     )
     systemd_service.response_restart_unit = "/org/freedesktop/systemd1/job/7623"
-    with patch("supervisor.mounts.mount.Path.is_mount", side_effect=[False, True]):
+    # Probe fails after reload (server still unreachable) but succeeds
+    # after restart — exercises the reload -> restart escalation path.
+    with patch(
+        "supervisor.mounts.mount._probe_network_mount",
+        side_effect=[OSError(errno.EHOSTDOWN, "Host is down"), True],
+    ):
         await mount.reload()
 
     assert mount.state == UnitActiveState.ACTIVE
@@ -570,7 +600,15 @@ async def test_reload_failure(
     systemd_service.RestartUnit.calls.clear()
     systemd_service.GetUnit.calls.clear()
     systemd_unit_service.active_state = "failed"
-    with pytest.raises(MountError):
+    # Force the fast-path probe to fail so reload actually exercises the
+    # reload -> restart escalation we're testing here.
+    with (
+        patch(
+            "supervisor.mounts.mount._probe_network_mount",
+            side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+        ),
+        pytest.raises(MountError),
+    ):
         await mount.reload()
 
     assert mount.state == UnitActiveState.FAILED
@@ -591,6 +629,55 @@ async def test_reload_failure(
     assert len(systemd_service.ReloadOrRestartUnit.calls) == 1
     assert len(systemd_service.StartTransientUnit.calls) == 1
     assert len(systemd_service.GetUnit.calls) == 1
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern", "mock_is_mount")
+async def test_reload_does_not_escalate_when_still_reloading(
+    coresys: CoreSys, all_dbus_services: dict[str, DBusServiceMock]
+):
+    """If the reload helper is still pinned (unit stays RELOADING), do not call RestartUnit.
+
+    Issuing RestartUnit while a mount/umount syscall is stuck in the kernel can
+    wedge PID 1 long enough for the hardware watchdog to reset the host. See
+    issue #6827.
+    """
+    systemd_service: SystemdService = all_dbus_services["systemd"]
+    systemd_unit_service: SystemdUnitService = all_dbus_services["systemd_unit"]
+    systemd_service.ReloadOrRestartUnit.calls.clear()
+    systemd_service.RestartUnit.calls.clear()
+    systemd_service.response_reload_or_restart_unit = (
+        "/org/freedesktop/systemd1/job/7624"
+    )
+    systemd_unit_service.active_state = "reloading"
+
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "test",
+            "usage": "media",
+            "type": "cifs",
+            "server": "test.local",
+            "share": "share",
+        },
+    )
+
+    # Simulate the state-await timing out without the unit leaving RELOADING:
+    # the helper is pinned in the kernel and systemd has not yet completed the
+    # reload job. The state-await is responsible for refreshing self._state in
+    # this case, so we mirror that here.
+    # pylint: disable=protected-access
+    async def _fake_update_state_await(self, unit, expected_states=None):
+        await self._update_state(unit)  # noqa: SLF001
+
+    with (
+        patch.object(Mount, "_update_state_await", _fake_update_state_await),
+        pytest.raises(MountActivationError),
+    ):
+        await mount.reload()
+
+    assert mount.state == UnitActiveState.RELOADING
+    assert len(systemd_service.ReloadOrRestartUnit.calls) == 1
+    assert systemd_service.RestartUnit.calls == []
 
 
 async def test_mount_local_where_invalid(
@@ -624,7 +711,7 @@ async def test_mount_local_where_invalid(
         await mount.mount()
 
     # Cannot mount on top of a non-empty directory
-    os.remove(mount_path)
+    mount_path.unlink()
     mount_path.mkdir()
     (mount_path / "test").touch()
 
@@ -669,7 +756,7 @@ async def test_update_clears_issue(coresys: CoreSys, path_extern, mock_is_mount)
 async def test_update_leaves_issue_if_down(
     coresys: CoreSys, mock_is_mount: MagicMock, path_extern
 ):
-    """Test issue is left if system is down after update (is_mount is false)."""
+    """Test issue is left if system is down after update (probe fails)."""
     mount = Mount.from_dict(
         coresys,
         {
@@ -693,8 +780,11 @@ async def test_update_leaves_issue_if_down(
     assert mount.failed_issue in coresys.resolution.issues
     assert len(coresys.resolution.suggestions_for_issue(mount.failed_issue)) == 2
 
-    mock_is_mount.return_value = False
-    assert (await mount.update()) is False
+    with patch(
+        "supervisor.mounts.mount._probe_network_mount",
+        side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+    ):
+        assert (await mount.update()) is False
 
     assert mount.state == UnitActiveState.ACTIVE
     assert mount.failed_issue in coresys.resolution.issues
@@ -708,7 +798,7 @@ async def test_mount_fails_if_down(
     mock_is_mount: MagicMock,
     path_extern,
 ):
-    """Test mount fails if system is down (is_mount is false)."""
+    """Test mount fails if system is down (probe fails after activation)."""
     systemd_service: SystemdService = all_dbus_services["systemd"]
     systemd_service.StartTransientUnit.calls.clear()
 
@@ -723,8 +813,13 @@ async def test_mount_fails_if_down(
     }
     mount: NFSMount = Mount.from_dict(coresys, mount_data)
 
-    mock_is_mount.return_value = False
-    with pytest.raises(MountActivationError):
+    with (
+        patch(
+            "supervisor.mounts.mount._probe_network_mount",
+            side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+        ),
+        pytest.raises(MountActivationError),
+    ):
         await mount.mount()
 
     assert mount.state == UnitActiveState.ACTIVE
@@ -736,10 +831,11 @@ async def test_mount_fails_if_down(
             "mnt-data-supervisor-mounts-test.mount",
             "fail",
             [
-                ["Options", Variant("s", "port=1234,soft,timeo=200")],
-                ["Type", Variant("s", "nfs")],
-                ["Description", Variant("s", "Supervisor nfs mount: test")],
-                ["What", Variant("s", "test.local:/media/camera")],
+                ("Options", Variant("s", "port=1234,softerr,timeo=100,retrans=2")),
+                ("Type", Variant("s", "nfs")),
+                ("Description", Variant("s", "Supervisor nfs mount: test")),
+                ("What", Variant("s", "test.local:/media/camera")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         )

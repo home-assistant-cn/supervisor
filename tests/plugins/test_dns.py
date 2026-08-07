@@ -6,6 +6,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiodocker.containers import DockerContainer
 import pytest
 
 from supervisor.const import BusEvent, LogLevel
@@ -13,8 +14,13 @@ from supervisor.coresys import CoreSys
 from supervisor.docker.const import ContainerState
 from supervisor.docker.dns import DockerDNS
 from supervisor.docker.monitor import DockerContainerStateEvent
-from supervisor.plugins.dns import HostEntry
-from supervisor.resolution.const import ContextType, IssueType, SuggestionType
+from supervisor.plugins.dns import HostEntry, PluginDns
+from supervisor.resolution.const import (
+    ContextType,
+    IssueType,
+    SuggestionType,
+    UnhealthyReason,
+)
 from supervisor.resolution.data import Issue, Suggestion
 
 
@@ -95,7 +101,7 @@ async def test_reset(coresys: CoreSys):
     coresys.plugins.dns.servers = ["dns://1.1.1.1", "dns://8.8.8.8"]
     coresys.plugins.dns.fallback = False
     coresys.plugins.dns._loop = True  # pylint: disable=protected-access
-    assert len(coresys.addons.installed) == 0
+    assert len(coresys.apps.installed) == 0
 
     with (
         patch.object(type(coresys.plugins.dns.hosts), "unlink") as unlink,
@@ -145,34 +151,50 @@ async def test_reset(coresys: CoreSys):
         ]
 
 
-async def test_loop_detection_on_failure(coresys: CoreSys):
+@pytest.mark.parametrize(
+    ("error_num", "unhealthy"),
+    [(errno.EBUSY, False), (errno.EBADMSG, True)],
+)
+async def test_reset_hosts_unlink_oserror(
+    coresys: CoreSys, error_num: int, unhealthy: bool
+):
+    """Test reset does not fail if hosts cannot be removed but checks OSError."""
+    err = OSError()
+    err.errno = error_num
+
+    with (
+        patch.object(type(coresys.plugins.dns.hosts), "unlink", side_effect=err),
+        patch.object(type(coresys.plugins.dns), "write_hosts"),
+    ):
+        await coresys.plugins.dns.reset()
+
+    assert (
+        UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
+    ) is unhealthy
+
+
+async def test_loop_detection_on_failure(coresys: CoreSys, container: DockerContainer):
     """Test loop detection when coredns fails."""
     assert len(coresys.resolution.issues) == 0
     assert len(coresys.resolution.suggestions) == 0
 
     with (
-        patch.object(type(coresys.plugins.dns.instance), "attach"),
-        patch.object(
-            type(coresys.plugins.dns.instance),
-            "is_running",
-            return_value=True,
-        ),
+        patch.object(DockerDNS, "attach"),
+        patch.object(DockerDNS, "is_running", return_value=True),
     ):
         await coresys.plugins.dns.load()
 
     with (
-        patch.object(type(coresys.plugins.dns), "rebuild") as rebuild,
+        patch.object(PluginDns, "rebuild") as rebuild,
         patch.object(
-            type(coresys.plugins.dns.instance),
+            DockerDNS,
             "current_state",
             side_effect=[
                 ContainerState.FAILED,
                 ContainerState.FAILED,
             ],
         ),
-        patch.object(type(coresys.plugins.dns.instance), "logs") as logs,
     ):
-        logs.return_value = b""
         coresys.bus.fire_event(
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
@@ -180,6 +202,7 @@ async def test_loop_detection_on_failure(coresys: CoreSys):
                 state=ContainerState.FAILED,
                 id="abc123",
                 time=1,
+                exit_code=1,
             ),
         )
         await asyncio.sleep(0)
@@ -188,7 +211,7 @@ async def test_loop_detection_on_failure(coresys: CoreSys):
         rebuild.assert_called_once()
 
         rebuild.reset_mock()
-        logs.return_value = b"plugin/loop: Loop"
+        container.log.return_value = ["plugin/loop: Loop"]
         coresys.bus.fire_event(
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(
@@ -196,6 +219,7 @@ async def test_loop_detection_on_failure(coresys: CoreSys):
                 state=ContainerState.FAILED,
                 id="abc123",
                 time=1,
+                exit_code=1,
             ),
         )
         await asyncio.sleep(0)
@@ -422,18 +446,18 @@ async def test_dns_restart_triggers_connectivity_check(coresys: CoreSys):
     # Verify listener was registered (connectivity check listener should be stored)
     assert dns_plugin._connectivity_check_listener is not None
 
-    # Create event to signal when connectivity check is called
+    # Create event to signal when connectivity check is requested
     connectivity_check_event = asyncio.Event()
 
-    # Mock connectivity check to set the event when called
-    async def mock_check_connectivity():
+    # Mock the fire-and-forget request to set the event when called
+    def mock_request_connectivity_check(*, force: bool = False):
         connectivity_check_event.set()
 
     with (
         patch.object(
             coresys.supervisor,
-            "check_connectivity",
-            side_effect=mock_check_connectivity,
+            "request_connectivity_check",
+            side_effect=mock_request_connectivity_check,
         ),
         patch("supervisor.plugins.dns.asyncio.sleep") as mock_sleep,
     ):
@@ -470,14 +494,8 @@ async def test_dns_restart_triggers_connectivity_check(coresys: CoreSys):
         )
 
         # Wait a bit and verify connectivity check was NOT triggered
-        try:
+        with pytest.raises(TimeoutError):
             await asyncio.wait_for(connectivity_check_event.wait(), timeout=0.1)
-            assert False, (
-                "Connectivity check should not have been called for other containers"
-            )
-        except TimeoutError:
-            # This is expected - connectivity check should not be called
-            pass
 
         # Verify sleep was not called for other containers
         mock_sleep.assert_not_called()

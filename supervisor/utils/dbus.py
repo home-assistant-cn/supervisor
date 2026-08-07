@@ -7,13 +7,7 @@ from collections.abc import Awaitable, Callable
 import logging
 from typing import Any, Protocol, cast
 
-from dbus_fast import (
-    ErrorType,
-    InvalidIntrospectionError,
-    Message,
-    MessageType,
-    Variant,
-)
+from dbus_fast import ErrorType, InvalidIntrospectionError, Message, MessageType
 from dbus_fast.aio.message_bus import MessageBus
 from dbus_fast.aio.proxy_object import ProxyInterface, ProxyObject
 from dbus_fast.errors import DBusError as DBusFastDBusError
@@ -27,6 +21,7 @@ from ..exceptions import (
     DBusInterfaceMethodError,
     DBusInterfacePropertyError,
     DBusInterfaceSignalError,
+    DBusInvalidArgsError,
     DBusNoReplyError,
     DBusNotConnectedError,
     DBusObjectError,
@@ -90,12 +85,10 @@ class DBus:
             return DBusServiceUnkownError(err.text)
         if err.type == ErrorType.UNKNOWN_INTERFACE:
             return DBusInterfaceError(err.text)
-        if err.type in {
-            ErrorType.UNKNOWN_METHOD,
-            ErrorType.INVALID_SIGNATURE,
-            ErrorType.INVALID_ARGS,
-        }:
+        if err.type in {ErrorType.UNKNOWN_METHOD, ErrorType.INVALID_SIGNATURE}:
             return DBusInterfaceMethodError(err.text)
+        if err.type == ErrorType.INVALID_ARGS:
+            return DBusInvalidArgsError(err.text)
         if err.type == ErrorType.UNKNOWN_OBJECT:
             return DBusObjectError(err.text)
         if err.type in {ErrorType.UNKNOWN_PROPERTY, ErrorType.PROPERTY_READ_ONLY}:
@@ -265,7 +258,7 @@ class DBus:
         """
 
         async def sync_property_change(
-            prop_interface: str, changed: dict[str, Variant], invalidated: list[str]
+            prop_interface: str, changed: dict[str, Any], invalidated: list[str]
         ) -> None:
             """Sync property changes to cache."""
             if interface != prop_interface:
@@ -305,9 +298,20 @@ class DBus:
 
         self._signal_monitors = {}
 
-    def signal(self, signal_member: str) -> DBusSignalWrapper:
-        """Get signal context manager for this object."""
-        return DBusSignalWrapper(self, signal_member)
+    def signal(
+        self,
+        signal_member: str,
+        message_filter: Callable[..., bool] | None = None,
+    ) -> DBusSignalWrapper:
+        """Get signal context manager for this object.
+
+        message_filter is invoked with the signal body unpacked positionally
+        (`filter(*msg.body)`) and only signals where it returns True are
+        delivered to `wait_for_signal`. Useful when subscribing to a
+        broadcast signal but only caring about specific payloads (e.g.
+        systemd's JobRemoved, where we want one specific job path).
+        """
+        return DBusSignalWrapper(self, signal_member, message_filter)
 
     def _add_signal_monitor(
         self, interface: str, dbus_name: str, callback: Callable
@@ -364,7 +368,7 @@ class DBusCallWrapper:
     def __call__(self, *args, **kwargs) -> None:
         """Catch this method from being called."""
         _LOGGER.error("D-Bus method %s not exists!", self.interface)
-        raise DBusInterfaceMethodError()
+        raise DBusInterfaceMethodError
 
     def _dbus_action(
         self, name: str
@@ -444,7 +448,7 @@ class DBusCallWrapper:
 
             return _method_wrapper
 
-        elif dbus_type == "set":
+        if dbus_type == "set":
 
             def _set_wrapper(*args) -> Awaitable:
                 return DBus.call_dbus(dbus_proxy, name, *args, unpack_variants=False)
@@ -488,7 +492,12 @@ class DBusCallWrapper:
 class DBusSignalWrapper:
     """Wrapper for D-Bus Signal."""
 
-    def __init__(self, dbus: DBus, signal_member: str) -> None:
+    def __init__(
+        self,
+        dbus: DBus,
+        signal_member: str,
+        message_filter: Callable[..., bool] | None = None,
+    ) -> None:
         """Initialize wrapper."""
         self._dbus: DBus = dbus
         signal_parts = signal_member.split(".")
@@ -496,6 +505,7 @@ class DBusSignalWrapper:
         self._member = signal_parts[-1]
         self._match: str = f"type='signal',interface={self._interface},member={self._member},path={self._dbus.object_path}"
         self._messages: asyncio.Queue[Message] = asyncio.Queue()
+        self._filter = message_filter
 
     def _message_handler(self, msg: Message):
         if msg.message_type != MessageType.SIGNAL:
@@ -535,9 +545,15 @@ class DBusSignalWrapper:
         return self
 
     async def wait_for_signal(self) -> Any:
-        """Wait for signal and returns signal payload."""
-        msg = await self._messages.get()
-        return msg.body
+        """Wait for signal and returns signal payload.
+
+        If a message_filter was provided at construction, non-matching
+        signals are discarded and the wait continues.
+        """
+        while True:
+            msg = await self._messages.get()
+            if self._filter is None or self._filter(*msg.body):
+                return msg.body
 
     async def __aexit__(self, exc_t, exc_v, exc_tb):
         """Stop collecting signal messages and remove match for signals."""

@@ -77,6 +77,7 @@ class IpProperties(ABC):
     method: str | None
     address_data: list[IpAddress] | None
     gateway: str | None
+    route_metric: int | None
 
 
 @dataclass(slots=True)
@@ -90,8 +91,8 @@ class Ip4Properties(IpProperties):
 class Ip6Properties(IpProperties):
     """IPv6 properties object for Network Manager."""
 
-    addr_gen_mode: int
-    ip6_privacy: int
+    addr_gen_mode: int | None
+    ip6_privacy: int | None
     dns: list[bytes] | None
 
 

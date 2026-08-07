@@ -13,16 +13,18 @@ from ...jobs.const import JobCondition, JobThrottle
 from ...jobs.decorator import Job
 from ...utils.sentry import async_capture_exception
 from ..const import DNS_CHECK_HOST, ContextType, IssueType
+from ..data import Issue
 from .base import CheckBase
 
 
 async def check_server(
-    loop: asyncio.AbstractEventLoop, server: str, qtype: Literal["A"] | Literal["AAAA"]
+    loop: asyncio.AbstractEventLoop, server: str, qtype: Literal["A", "AAAA"]
 ) -> None:
     """Check a DNS server and report issues."""
     ip_addr = server[6:] if server.startswith("dns://") else server
     async with DNSResolver(loop=loop, nameservers=[ip_addr]) as resolver:
-        await resolver.query(DNS_CHECK_HOST, qtype)
+        # following call should be changed to resolver.query() in aiodns 5.x
+        await resolver.query_dns(DNS_CHECK_HOST, qtype)
 
 
 def setup(coresys: CoreSys) -> CheckBase:
@@ -38,6 +40,7 @@ class CheckDNSServer(CheckBase):
         conditions=[JobCondition.INTERNET_SYSTEM],
         throttle_period=timedelta(hours=24),
         throttle=JobThrottle.THROTTLE,
+        internal=True,
     )
     async def run_check(self) -> None:
         """Run check if not affected by issue."""
@@ -56,14 +59,18 @@ class CheckDNSServer(CheckBase):
                 )
                 await async_capture_exception(result)
 
-    @Job(name="check_dns_server_approve", conditions=[JobCondition.INTERNET_SYSTEM])
-    async def approve_check(self, reference: str | None = None) -> bool:
+    @Job(
+        name="check_dns_server_approve",
+        conditions=[JobCondition.INTERNET_SYSTEM],
+        internal=True,
+    )
+    async def approve_check(self, issue: Issue) -> bool:
         """Approve check if it is affected by issue."""
-        if reference not in self.dns_servers:
+        if issue.reference not in self.dns_servers:
             return False
 
         try:
-            await check_server(self.sys_loop, reference, "A")
+            await check_server(self.sys_loop, issue.reference, "A")
         except DNSError:
             return True
 

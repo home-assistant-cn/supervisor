@@ -1,4 +1,4 @@
-"""Constants for the resoulution manager."""
+"""Constants for the resolution manager."""
 
 from enum import StrEnum
 from pathlib import Path
@@ -58,14 +58,18 @@ class UnsupportedReason(StrEnum):
     SYSTEMD_JOURNAL = "systemd_journal"
     SYSTEMD_RESOLVED = "systemd_resolved"
     VIRTUALIZATION_IMAGE = "virtualization_image"
+    SYSTEM_ARCHITECTURE = "system_architecture"
 
 
 class UnhealthyReason(StrEnum):
     """Reasons for unsupported status."""
 
+    DATA_FILESYSTEM_CHECK_ERROR = "data_filesystem_check_error"
     DOCKER = "docker"
+    DOCKER_GATEWAY_UNPROTECTED = "docker_gateway_unprotected"
     DUPLICATE_OS_INSTALLATION = "duplicate_os_installation"
     OSERROR_BAD_MESSAGE = "oserror_bad_message"
+    OS_FILESYSTEM_CHECK_ERROR = "os_filesystem_check_error"
     PRIVILEGED = "privileged"
     SETUP = "setup"
     SUPERVISOR = "supervisor"
@@ -75,11 +79,13 @@ class UnhealthyReason(StrEnum):
 class IssueType(StrEnum):
     """Issue type."""
 
+    APP_PORT_CONFLICT = "app_port_conflict"
     BOOT_FAIL = "boot_fail"
     CORRUPT_DOCKER = "corrupt_docker"
     CORRUPT_REPOSITORY = "corrupt_repository"
     CORRUPT_FILESYSTEM = "corrupt_filesystem"
     DEPRECATED_ADDON = "deprecated_addon"
+    DEPRECATED_ARCH_ADDON = "deprecated_arch_addon"
     DETACHED_ADDON_MISSING = "detached_addon_missing"
     DETACHED_ADDON_REMOVED = "detached_addon_removed"
     DEVICE_ACCESS_MISSING = "device_access_missing"
@@ -98,20 +104,25 @@ class IssueType(StrEnum):
     MOUNT_FAILED = "mount_failed"
     MULTIPLE_DATA_DISKS = "multiple_data_disks"
     NO_CURRENT_BACKUP = "no_current_backup"
+    NTP_SYNC_FAILED = "ntp_sync_failed"
     PWNED = "pwned"
     REBOOT_REQUIRED = "reboot_required"
+    RPI_FIRMWARE_UPDATE_BLOCKED = "rpi_firmware_update_blocked"
     SECURITY = "security"
+    SYSTEMD_UNIT_FAILED = "systemd_unit_failed"
     UPDATE_FAILED = "update_failed"
     UPDATE_ROLLBACK = "update_rollback"
 
 
 class SuggestionType(StrEnum):
-    """Sugestion type."""
+    """Suggestion type."""
 
     ADOPT_DATA_DISK = "adopt_data_disk"
     CLEAR_FULL_BACKUP = "clear_full_backup"
+    CLEAR_PORT_CONFIG = "clear_port_config"
     CREATE_FULL_BACKUP = "create_full_backup"
     DISABLE_BOOT = "disable_boot"
+    ENABLE_NTP = "enable_ntp"
     EXECUTE_REBOOT = "execute_reboot"
     EXECUTE_REBUILD = "execute_rebuild"
     EXECUTE_RELOAD = "execute_reload"

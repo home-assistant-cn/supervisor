@@ -26,14 +26,11 @@ from supervisor.jobs.job_group import JobGroup
 from supervisor.os.manager import OSManager
 from supervisor.plugins.audio import PluginAudio
 from supervisor.resolution.const import UnhealthyReason, UnsupportedReason
-from supervisor.supervisor import Supervisor
 from supervisor.utils.dt import utcnow
-
-from tests.common import reset_last_call
 
 
 async def test_healthy(coresys: CoreSys, caplog: pytest.LogCaptureFixture):
-    """Test the healty decorator."""
+    """Test the healthy decorator."""
 
     class TestClass:
         """Test class."""
@@ -59,7 +56,7 @@ async def test_healthy(coresys: CoreSys, caplog: pytest.LogCaptureFixture):
 
 
 @pytest.mark.parametrize(
-    "connectivity,head_side_effect,host_result,system_result",
+    ("connectivity", "head_side_effect", "host_result", "system_result"),
     [
         (4, None, True, True),
         (4, ClientError(), True, None),
@@ -76,7 +73,6 @@ async def test_internet(
 ):
     """Test the internet decorator."""
     await coresys.core.set_state(CoreState.RUNNING)
-    reset_last_call(Supervisor.check_connectivity)
 
     class TestClass:
         """Test class."""
@@ -105,7 +101,9 @@ async def test_internet(
 
     mock_websession = AsyncMock()
     mock_websession.head.side_effect = head_side_effect
-    coresys.supervisor.connectivity = None
+    # Reset cached state so the precondition path actually runs a probe.
+    coresys.supervisor._connectivity = True  # pylint: disable=protected-access
+    coresys.supervisor._connectivity_last_check = float("-inf")  # pylint: disable=protected-access
     with (
         patch("supervisor.utils.dbus.DBus.call_dbus", return_value=connectivity),
         patch.object(
@@ -188,7 +186,7 @@ async def test_exception(coresys: CoreSys, capture_exception: Mock):
         @Job(name="test_exception_execute", conditions=[JobCondition.HEALTHY])
         async def execute(self):
             """Execute the class method."""
-            raise HassioError()
+            raise HassioError
 
     test = TestClass(coresys)
 
@@ -528,6 +526,35 @@ async def test_plugins_updated(coresys: CoreSys):
         assert await test.execute()
 
 
+async def test_plugins_updated_skips_update_when_auto_update_disabled(coresys: CoreSys):
+    """Test plugins updated condition blocks when auto update is disabled."""
+
+    class TestClass:
+        """Test class."""
+
+        def __init__(self, coresys: CoreSys):
+            """Initialize the test class."""
+            self.coresys = coresys
+
+        @Job(
+            name="test_plugins_updated_auto_update_disabled_execute",
+            conditions=[JobCondition.PLUGINS_UPDATED],
+        )
+        async def execute(self) -> bool:
+            """Execute the class method."""
+            return True
+
+    test = TestClass(coresys)
+    coresys.updater.auto_update = False
+
+    with (
+        patch.object(PluginAudio, "need_update", new=PropertyMock(return_value=True)),
+        patch.object(PluginAudio, "update") as update,
+    ):
+        assert not await test.execute()
+        update.assert_not_called()
+
+
 async def test_auto_update(coresys: CoreSys):
     """Test the auto update decorator."""
 
@@ -653,7 +680,7 @@ async def test_job_group_reject(coresys: CoreSys):
             on_condition=JobException,
         )
         async def unrelated_method(self) -> bool:
-            """Unrelated method, sparate job with separate lock."""
+            """Unrelated method, separate job with separate lock."""
             return True
 
     test = TestClass(coresys)
@@ -941,7 +968,7 @@ async def test_group_throttle_rate_limit(coresys: CoreSys, error: JobException |
 
     start = utcnow()
 
-    with time_machine.travel(start):
+    with time_machine.travel(start, tick=False):
         await asyncio.gather(
             *[test1.execute(), test1.execute(), test2.execute(), test2.execute()]
         )
@@ -1407,7 +1434,7 @@ async def test_core_supported(coresys: CoreSys, caplog: pytest.LogCaptureFixture
     test = TestClass(coresys)
     assert await test.execute()
 
-    coresys.resolution.unsupported.append(UnsupportedReason.HOME_ASSISTANT_CORE_VERSION)
+    coresys.resolution.unsupported.add(UnsupportedReason.HOME_ASSISTANT_CORE_VERSION)
     assert not await test.execute()
     assert (
         "blocked from execution, unsupported Home Assistant Core version" in caplog.text

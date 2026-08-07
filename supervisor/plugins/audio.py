@@ -3,7 +3,6 @@
 Code: https://github.com/home-assistant/plugin-audio
 """
 
-import errno
 import logging
 from pathlib import Path, PurePath
 import shutil
@@ -26,7 +25,6 @@ from ..exceptions import (
 )
 from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
-from ..resolution.const import UnhealthyReason
 from ..utils.json import write_json_file
 from ..utils.sentry import async_capture_exception
 from .base import PluginBase
@@ -94,11 +92,7 @@ class PluginAudio(PluginBase):
                 )
             )
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
-
+            self.sys_resolution.check_oserror(err)
             _LOGGER.error("Can't read pulse-client.tmpl: %s", err)
 
         await super().load()
@@ -113,10 +107,7 @@ class PluginAudio(PluginBase):
         try:
             await self.sys_run_in_executor(setup_default_asound)
         except OSError as err:
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
+            self.sys_resolution.check_oserror(err)
             _LOGGER.error("Can't create default asound: %s", err)
 
     @Job(
@@ -162,7 +153,7 @@ class PluginAudio(PluginBase):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise AudioError() from err
+            raise AudioError from err
 
     async def repair(self) -> None:
         """Repair Audio plugin."""
@@ -210,6 +201,8 @@ class PluginAudio(PluginBase):
         on_condition=AudioJobError,
         throttle=JobThrottle.RATE_LIMIT,
     )
-    async def _restart_after_problem(self, state: ContainerState):
+    async def _restart_after_problem(
+        self, state: ContainerState, exit_code: int | None = None
+    ):
         """Restart unhealthy or failed plugin."""
-        return await super()._restart_after_problem(state)
+        return await super()._restart_after_problem(state, exit_code)

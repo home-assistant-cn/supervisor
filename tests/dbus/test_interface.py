@@ -28,12 +28,12 @@ class TestInterface(DBusServiceMock):
         self.object_path = object_path
 
     @signal(name="TestSignal")
-    def test_signal(self, value: str) -> "s":  # noqa: F821
+    def test_signal(self, value: str) -> "s":  # noqa: F821, UP037
         """Send test signal."""
         return value
 
     @dbus_property(access=PropertyAccess.READ, name="TestProp")
-    def test_prop(self) -> "u":  # noqa: F821
+    def test_prop(self) -> "u":  # noqa: F821, UP037
         """Get test property."""
         return 4
 
@@ -52,7 +52,7 @@ async def fixture_test_service(dbus_session_bus: MessageBus) -> TestInterface:
     await dbus_session_bus.request_name("service.test.TestInterface")
     service = TestInterface()
     service.export(dbus_session_bus)
-    yield service
+    return service
 
 
 @pytest.fixture(name="proxy")
@@ -65,7 +65,7 @@ async def fixture_proxy(
     proxy = ServiceTest()
     proxy.sync_properties = getattr(request, "param", True)
     await proxy.connect(dbus_session_bus)
-    yield proxy
+    return proxy
 
 
 async def test_dbus_proxy_connect(

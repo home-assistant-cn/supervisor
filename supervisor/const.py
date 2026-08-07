@@ -1,28 +1,34 @@
 """Constants file for Supervisor."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
 from sys import version_info as systemversion
-from typing import NotRequired, Self, TypedDict
+from typing import Any, NotRequired, Self, TypedDict
 
 from aiohttp import __version__ as aiohttpversion
+from aiohttp.web import RequestKey
 
 SUPERVISOR_VERSION = "9999.09.9.dev9999"
 SERVER_SOFTWARE = f"HomeAssistantSupervisor/{SUPERVISOR_VERSION} aiohttp/{aiohttpversion} Python/{systemversion[0]}.{systemversion[1]}"
 
 DOCKER_PREFIX: str = "hassio"
+AUDIO_DOCKER_NAME: str = f"{DOCKER_PREFIX}_audio"
+CLI_DOCKER_NAME: str = f"{DOCKER_PREFIX}_cli"
+DNS_DOCKER_NAME: str = f"{DOCKER_PREFIX}_dns"
 OBSERVER_DOCKER_NAME: str = f"{DOCKER_PREFIX}_observer"
 SUPERVISOR_DOCKER_NAME: str = f"{DOCKER_PREFIX}_supervisor"
 
-URL_HASSIO_ADDONS = "https://github.com/home-assistant/addons"
+URL_HASSIO_APPS = "https://github.com/home-assistant/addons"
 URL_HASSIO_APPARMOR = "https://version.home-assistant.io/apparmor_{channel}.txt"
 URL_HASSIO_VERSION = "https://version.home-assistant.io/{channel}.json"
 
 SUPERVISOR_DATA = Path("/data")
 
 FILE_HASSIO_ADDONS = Path(SUPERVISOR_DATA, "addons.json")
+FILE_HASSIO_APPS = Path(SUPERVISOR_DATA, "apps.json")
 FILE_HASSIO_AUTH = Path(SUPERVISOR_DATA, "auth.json")
 FILE_HASSIO_BACKUPS = Path(SUPERVISOR_DATA, "backups.json")
 FILE_HASSIO_BOARD = Path(SUPERVISOR_DATA, "board.json")
@@ -38,9 +44,10 @@ FILE_HASSIO_SECURITY = Path(SUPERVISOR_DATA, "security.json")
 FILE_SUFFIX_CONFIGURATION = [".yaml", ".yml", ".json"]
 
 MACHINE_ID = Path("/etc/machine-id")
+RUN_SUPERVISOR_STATE = Path("/run/supervisor")
+SOCKET_CORE = Path("/run/os/core.sock")
 SOCKET_DBUS = Path("/run/dbus/system_bus_socket")
 SOCKET_DOCKER = Path("/run/docker.sock")
-RUN_SUPERVISOR_STATE = Path("/run/supervisor")
 SYSTEMD_JOURNAL_PERSISTENT = Path("/var/log/journal")
 SYSTEMD_JOURNAL_VOLATILE = Path("/run/log/journal")
 
@@ -49,6 +56,10 @@ DOCKER_NETWORK_DRIVER = "bridge"
 DOCKER_IPV6_NETWORK_MASK = IPv6Network("fd0c:ac1e:2100::/48")
 DOCKER_IPV4_NETWORK_MASK = IPv4Network("172.30.32.0/23")
 DOCKER_IPV4_NETWORK_RANGE = IPv4Network("172.30.33.0/24")
+
+# Range used for dynamically assigned ingress ports (ingress_port: 0).
+INGRESS_DYNAMIC_PORT_MIN = 62000
+INGRESS_DYNAMIC_PORT_MAX = 65500
 
 # This needs to match the dockerd --cpu-rt-runtime= argument.
 DOCKER_CPU_RUNTIME_TOTAL = 950_000
@@ -64,11 +75,15 @@ DOCKER_CPU_RUNTIME_ALLOCATION = int(DOCKER_CPU_RUNTIME_TOTAL / 5)
 DNS_SUFFIX = "local.hass.io"
 
 LABEL_ARCH = "io.hass.arch"
+LABEL_DESCRIPTION = "io.hass.description"
 LABEL_MACHINE = "io.hass.machine"
+LABEL_NAME = "io.hass.name"
 LABEL_TYPE = "io.hass.type"
+LABEL_URL = "io.hass.url"
 LABEL_VERSION = "io.hass.version"
 
-META_ADDON = "addon"
+META_ADDON = "addon"  # legacy label for app
+META_APP = "app"
 META_HOMEASSISTANT = "homeassistant"
 META_SUPERVISOR = "supervisor"
 
@@ -95,7 +110,7 @@ ENV_SUPERVISOR_NAME = "SUPERVISOR_NAME"
 ENV_SUPERVISOR_SHARE = "SUPERVISOR_SHARE"
 ENV_SUPERVISOR_CPU_RT = "SUPERVISOR_CPU_RT"
 
-REQUEST_FROM = "HASSIO_FROM"
+REQUEST_FROM: RequestKey[Any] = RequestKey("HASSIO_FROM")
 
 ATTR_ACCESS_TOKEN = "access_token"
 ATTR_ACCESSPOINTS = "accesspoints"
@@ -104,7 +119,10 @@ ATTR_ACTIVITY_LED = "activity_led"
 ATTR_ADDON = "addon"
 ATTR_ADDONS = "addons"
 ATTR_ADDONS_CUSTOM_LIST = "addons_custom_list"
-ATTR_ADDONS_REPOSITORIES = "addons_repositories"
+ATTR_APP = "app"
+ATTR_APPS = "apps"
+ATTR_APPS_CUSTOM_LIST = "apps_custom_list"
+ATTR_APPS_REPOSITORIES = "addons_repositories"
 ATTR_ADDR_GEN_MODE = "addr_gen_mode"
 ATTR_ADDRESS = "address"
 ATTR_ADDRESS_DATA = "address-data"
@@ -130,6 +148,7 @@ ATTR_BACKUPS = "backups"
 ATTR_BACKUPS_EXCLUDE_DATABASE = "backups_exclude_database"
 ATTR_BLK_READ = "blk_read"
 ATTR_BLK_WRITE = "blk_write"
+ATTR_BLOCKED_REASON = "blocked_reason"
 ATTR_BOARD = "board"
 ATTR_BOOT = "boot"
 ATTR_BRANCH = "branch"
@@ -152,7 +171,7 @@ ATTR_CONTENT_TRUST = "content_trust"
 ATTR_COUNTRY = "country"
 ATTR_CPE = "cpe"
 ATTR_CPU_PERCENT = "cpu_percent"
-ATTR_CRYPTO = "crypto"
+ATTR_CURRENT_VERSION = "current_version"
 ATTR_DATA = "data"
 ATTR_DATE = "date"
 ATTR_DAYS_UNTIL_STALE = "days_until_stale"
@@ -179,6 +198,7 @@ ATTR_DOCKER = "docker"
 ATTR_DOCKER_API = "docker_api"
 ATTR_DOCUMENTATION = "documentation"
 ATTR_DOMAINS = "domains"
+ATTR_DUPLICATE_LOG_FILE = "duplicate_log_file"
 ATTR_ENABLE = "enable"
 ATTR_ENABLE_IPV6 = "enable_ipv6"
 ATTR_ENABLED = "enabled"
@@ -187,6 +207,7 @@ ATTR_ENVIRONMENT = "environment"
 ATTR_EVENT = "event"
 ATTR_EXCLUDE_DATABASE = "exclude_database"
 ATTR_EXTRA = "extra"
+ATTR_FEATURE_FLAGS = "feature_flags"
 ATTR_FEATURES = "features"
 ATTR_FIELDS = "fields"
 ATTR_FILENAME = "filename"
@@ -245,6 +266,7 @@ ATTR_KERNEL = "kernel"
 ATTR_KERNEL_MODULES = "kernel_modules"
 ATTR_LABELS = "labels"
 ATTR_LAST_BOOT = "last_boot"
+ATTR_LATEST_VERSION = "latest_version"
 ATTR_LEGACY = "legacy"
 ATTR_LLMNR = "llmnr"
 ATTR_LOCALS = "locals"
@@ -304,6 +326,7 @@ ATTR_REGISTRIES = "registries"
 ATTR_REGISTRY = "registry"
 ATTR_REPOSITORIES = "repositories"
 ATTR_REPOSITORY = "repository"
+ATTR_ROUTE_METRIC = "route_metric"
 ATTR_SCHEMA = "schema"
 ATTR_SECURITY = "security"
 ATTR_SERIAL = "serial"
@@ -328,6 +351,7 @@ ATTR_STATE = "state"
 ATTR_STATIC = "static"
 ATTR_STDIN = "stdin"
 ATTR_STORAGE = "storage"
+ATTR_STORAGE_DRIVER = "storage_driver"
 ATTR_SUGGESTIONS = "suggestions"
 ATTR_SUPERVISOR = "supervisor"
 ATTR_SUPERVISOR_INTERNET = "supervisor_internet"
@@ -353,7 +377,9 @@ ATTR_UNHEALTHY = "unhealthy"
 ATTR_UNSAVED = "unsaved"
 ATTR_UNSUPPORTED = "unsupported"
 ATTR_UPDATE_AVAILABLE = "update_available"
+ATTR_UPDATE_BLOCKED = "update_blocked"
 ATTR_UPDATE_KEY = "update_key"
+ATTR_UPDATE_PENDING = "update_pending"
 ATTR_URL = "url"
 ATTR_USB = "usb"
 ATTR_USER = "user"
@@ -365,6 +391,7 @@ ATTR_VALUE = "value"
 ATTR_VERSION = "version"
 ATTR_VERSION_TIMESTAMP = "version_timestamp"
 ATTR_VERSION_LATEST = "version_latest"
+ATTR_VERSION_PENDING = "version_pending"
 ATTR_VIDEO = "video"
 ATTR_VLAN = "vlan"
 ATTR_VOLUME = "volume"
@@ -384,7 +411,20 @@ ARCH_AARCH64 = "aarch64"
 ARCH_AMD64 = "amd64"
 ARCH_I386 = "i386"
 
-ARCH_ALL = [ARCH_ARMHF, ARCH_ARMV7, ARCH_AARCH64, ARCH_AMD64, ARCH_I386]
+ARCH_ALL = [ARCH_AARCH64, ARCH_AMD64]
+ARCH_DEPRECATED = [ARCH_ARMHF, ARCH_ARMV7, ARCH_I386]
+ARCH_ALL_COMPAT = ARCH_ALL + ARCH_DEPRECATED
+
+MACHINE_DEPRECATED = [
+    "odroid-xu",
+    "qemuarm",
+    "qemux86",
+    "raspberrypi",
+    "raspberrypi2",
+    "raspberrypi3",
+    "raspberrypi4",
+    "tinker",
+]
 
 REPOSITORY_CORE = "core"
 REPOSITORY_LOCAL = "local"
@@ -394,8 +434,6 @@ FOLDER_SHARE = "share"
 FOLDER_ADDONS = "addons/local"
 FOLDER_SSL = "ssl"
 FOLDER_MEDIA = "media"
-
-CRYPTO_AES128 = "aes128"
 
 SECURITY_PROFILE = "profile"
 SECURITY_DEFAULT = "default"
@@ -409,17 +447,22 @@ ROLE_ADMIN = "admin"
 
 ROLE_ALL = [ROLE_DEFAULT, ROLE_HOMEASSISTANT, ROLE_BACKUP, ROLE_MANAGER, ROLE_ADMIN]
 
+OBSERVER_PORT = 4357
 
-class AddonBootConfig(StrEnum):
-    """Boot mode config for the add-on."""
+# Used for stream operations
+DEFAULT_CHUNK_SIZE = 2**16  # 64KiB
+
+
+class AppBootConfig(StrEnum):
+    """Boot mode config for the app."""
 
     AUTO = "auto"
     MANUAL = "manual"
     MANUAL_ONLY = "manual_only"
 
 
-class AddonBoot(StrEnum):
-    """Boot mode for the add-on."""
+class AppBoot(StrEnum):
+    """Boot mode for the app."""
 
     AUTO = "auto"
     MANUAL = "manual"
@@ -427,15 +470,15 @@ class AddonBoot(StrEnum):
     @classmethod
     def _missing_(cls, value: object) -> Self | None:
         """Convert 'forced' config values to their counterpart."""
-        if value == AddonBootConfig.MANUAL_ONLY:
+        if value == AppBootConfig.MANUAL_ONLY:
             for member in cls:
-                if member == AddonBoot.MANUAL:
+                if member == AppBoot.MANUAL:
                     return member
         return None
 
 
-class AddonStartup(StrEnum):
-    """Startup types of Add-on."""
+class AppStartup(StrEnum):
+    """Startup types of App."""
 
     INITIALIZE = "initialize"
     SYSTEM = "system"
@@ -444,16 +487,16 @@ class AddonStartup(StrEnum):
     ONCE = "once"
 
 
-class AddonStage(StrEnum):
-    """Stage types of add-on."""
+class AppStage(StrEnum):
+    """Stage types of app."""
 
     STABLE = "stable"
     EXPERIMENTAL = "experimental"
     DEPRECATED = "deprecated"
 
 
-class AddonState(StrEnum):
-    """State of add-on."""
+class AppState(StrEnum):
+    """State of app."""
 
     STARTUP = "startup"
     STARTED = "started"
@@ -521,67 +564,88 @@ class BusEvent(StrEnum):
 class CpuArch(StrEnum):
     """Supported CPU architectures."""
 
-    ARMV7 = "armv7"
-    ARMHF = "armhf"
     AARCH64 = "aarch64"
-    I386 = "i386"
     AMD64 = "amd64"
 
 
-class IngressSessionDataUserDict(TypedDict):
-    """Response object for ingress session user."""
+class FeatureFlag(StrEnum):
+    """Development features that can be toggled."""
 
-    id: str
-    username: NotRequired[str | None]
-    # Name is an alias for displayname, only one should be used
-    displayname: NotRequired[str | None]
-    name: NotRequired[str | None]
+    SUPERVISOR_V2_API = "supervisor_v2_api"
+    SUPERVISOR_WEBSOCKET_V2_API = "supervisor_websocket_v2_api"
 
 
 @dataclass
-class IngressSessionDataUser:
-    """Format of an IngressSessionDataUser object."""
+class HomeAssistantUser:
+    """A Home Assistant Core user.
+
+    Incomplete model — Core's User object has additional fields
+    (credentials, refresh_tokens, etc.) that are not represented here.
+    Only fields used by the Supervisor are included.
+    """
 
     id: str
-    display_name: str | None = None
     username: str | None = None
-
-    def to_dict(self) -> IngressSessionDataUserDict:
-        """Get dictionary representation."""
-        return IngressSessionDataUserDict(
-            id=self.id, displayname=self.display_name, username=self.username
-        )
+    name: str | None = None
+    is_owner: bool = False
+    is_active: bool = False
+    local_only: bool = False
+    system_generated: bool = False
+    group_ids: list[str] | None = None
 
     @classmethod
-    def from_dict(cls, data: IngressSessionDataUserDict) -> Self:
+    def from_dict(cls, data: Mapping[str, Any]) -> Self:
         """Return object from dictionary representation."""
         return cls(
             id=data["id"],
-            display_name=data.get("displayname") or data.get("name"),
             username=data.get("username"),
+            # "displayname" is a legacy key from old ingress session data
+            name=data.get("name") or data.get("displayname"),
+            is_owner=data.get("is_owner", False),
+            is_active=data.get("is_active", False),
+            local_only=data.get("local_only", False),
+            system_generated=data.get("system_generated", False),
+            group_ids=data.get("group_ids"),
         )
 
 
+class IngressSessionDataUserDict(TypedDict):
+    """Serialization format for user data stored in ingress sessions.
+
+    Legacy data may contain "displayname" instead of "name".
+    """
+
+    id: str
+    username: NotRequired[str | None]
+    name: NotRequired[str | None]
+
+
 class IngressSessionDataDict(TypedDict):
-    """Response object for ingress session data."""
+    """Serialization format for ingress session data."""
 
     user: IngressSessionDataUserDict
 
 
 @dataclass
 class IngressSessionData:
-    """Format of an IngressSessionData object."""
+    """Ingress session data attached to a session token."""
 
-    user: IngressSessionDataUser
+    user: HomeAssistantUser
 
     def to_dict(self) -> IngressSessionDataDict:
         """Get dictionary representation."""
-        return IngressSessionDataDict(user=self.user.to_dict())
+        return IngressSessionDataDict(
+            user=IngressSessionDataUserDict(
+                id=self.user.id,
+                name=self.user.name,
+                username=self.user.username,
+            )
+        )
 
     @classmethod
-    def from_dict(cls, data: IngressSessionDataDict) -> Self:
+    def from_dict(cls, data: Mapping[str, Any]) -> Self:
         """Return object from dictionary representation."""
-        return cls(user=IngressSessionDataUser.from_dict(data["user"]))
+        return cls(user=HomeAssistantUser.from_dict(data["user"]))
 
 
 STARTING_STATES = [

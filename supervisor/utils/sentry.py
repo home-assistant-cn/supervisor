@@ -3,6 +3,7 @@
 import asyncio
 from functools import partial
 import logging
+from typing import Literal
 
 from aiohttp.web_exceptions import HTTPBadGateway, HTTPServiceUnavailable
 import sentry_sdk
@@ -78,10 +79,53 @@ async def async_capture_exception(err: BaseException) -> None:
         )
 
 
+async def async_capture_message(
+    msg: str,
+    level: Literal["fatal", "critical", "error", "warning", "info", "debug"]
+    | None = "warning",
+) -> None:
+    """Capture a message and send to sentry.
+
+    Safe to call in event loop.
+    """
+    if sentry_sdk.is_initialized():
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            partial(sentry_sdk.capture_message, msg, level=level),
+        )
+
+
+def fire_and_forget_capture_message(
+    msg: str,
+    level: Literal["fatal", "critical", "error", "warning", "info", "debug"]
+    | None = "warning",
+) -> None:
+    """Capture a message and send to sentry without blocking the event loop.
+
+    Safe to call from sync code running in the event loop. The executor future
+    is intentionally not awaited (fire-and-forget).
+    """
+    if not sentry_sdk.is_initialized():
+        return
+
+    def _capture() -> None:
+        try:
+            sentry_sdk.capture_message(msg, level=level)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Failed to send message to Sentry: %s", msg)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _capture()
+    else:
+        loop.run_in_executor(None, _capture)
+
+
 def close_sentry() -> None:
     """Close the current sentry client.
 
-    This method is irreversible. A new client will have to be initialized to re-open connetion.
+    This method is irreversible. A new client will have to be initialized to re-open connection.
     """
     if sentry_sdk.is_initialized():
         _LOGGER.info("Closing connection to Supervisor Sentry")

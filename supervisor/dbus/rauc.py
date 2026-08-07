@@ -1,6 +1,5 @@
 """D-Bus interface for rauc."""
 
-from ctypes import c_uint32, c_uint64
 import logging
 from typing import Any, NotRequired, TypedDict
 
@@ -33,13 +32,15 @@ SlotStatusDataType = TypedDict(
         "state": str,
         "device": str,
         "bundle.compatible": NotRequired[str],
+        "bundle.hash": NotRequired[str],
         "sha256": NotRequired[str],
-        "size": NotRequired[c_uint64],
-        "installed.count": NotRequired[c_uint32],
+        "size": NotRequired[int],
+        "installed.count": NotRequired[int],
+        "installed.transaction": NotRequired[str],
         "bundle.version": NotRequired[str],
         "installed.timestamp": NotRequired[str],
         "status": NotRequired[str],
-        "activated.count": NotRequired[c_uint32],
+        "activated.count": NotRequired[int],
         "activated.timestamp": NotRequired[str],
         "boot-status": NotRequired[str],
         "bootname": NotRequired[str],
@@ -73,7 +74,7 @@ class Rauc(DBusInterfaceProxy):
             await super().connect(bus)
         except DBusError:
             _LOGGER.warning("Can't connect to rauc")
-        except (DBusServiceUnkownError, DBusInterfaceError):
+        except DBusServiceUnkownError, DBusInterfaceError:
             _LOGGER.warning("Host has no rauc support. OTA updates have been disabled.")
 
     @property
@@ -112,12 +113,17 @@ class Rauc(DBusInterfaceProxy):
         return await self.connected_dbus.Installer.call("get_slot_status")
 
     @dbus_connected
+    async def get_primary(self) -> str:
+        """Get primary boot slot."""
+        return await self.connected_dbus.Installer.call("get_primary")
+
+    @dbus_connected
     def signal_completed(self) -> DBusSignalWrapper:
         """Return a signal wrapper for completed signal."""
         return self.connected_dbus.signal(DBUS_SIGNAL_RAUC_INSTALLER_COMPLETED)
 
     @dbus_connected
-    async def mark(self, state: RaucState, slot_identifier: str) -> tuple[str, str]:
+    async def mark(self, state: RaucState, slot_identifier: str) -> list[str]:
         """Get slot status."""
         return await self.connected_dbus.Installer.call("mark", state, slot_identifier)
 

@@ -1,4 +1,4 @@
-"""Init file for Supervisor add-on data."""
+"""Init file for Supervisor app data."""
 
 from dataclasses import dataclass
 import errno
@@ -9,7 +9,11 @@ from typing import Any
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
-from ..addons.validate import SCHEMA_ADDON_CONFIG, SCHEMA_ADDON_TRANSLATIONS
+from ..apps.validate import (
+    SCHEMA_APP_CONFIG,
+    SCHEMA_APP_CONFIG_QUIET,
+    SCHEMA_APP_TRANSLATIONS,
+)
 from ..const import (
     ATTR_LOCATION,
     ATTR_REPOSITORY,
@@ -19,10 +23,11 @@ from ..const import (
     FILE_SUFFIX_CONFIGURATION,
     REPOSITORY_CORE,
     REPOSITORY_LOCAL,
+    UpdateChannel,
 )
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import ConfigurationFileError
-from ..resolution.const import ContextType, IssueType, SuggestionType, UnhealthyReason
+from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..utils.common import find_one_filetype, read_json_or_yaml_file
 from ..utils.json import read_json_file
 from .utils import extract_hash_from_path
@@ -40,12 +45,12 @@ class ProcessedRepository:
     config: dict[str, Any]
 
 
-def _read_addon_translations(addon_path: Path) -> dict:
-    """Read translations from add-ons folder.
+def _read_app_translations(app_path: Path) -> dict:
+    """Read translations from apps folder.
 
     Should be run in the executor.
     """
-    translations_dir = addon_path / "translations"
+    translations_dir = app_path / "translations"
     translations: dict[str, Any] = {}
 
     if not translations_dir.exists():
@@ -59,7 +64,7 @@ def _read_addon_translations(addon_path: Path) -> dict:
 
     for translation in translation_files:
         try:
-            translations[translation.stem] = SCHEMA_ADDON_TRANSLATIONS(
+            translations[translation.stem] = SCHEMA_APP_TRANSLATIONS(
                 read_json_or_yaml_file(translation)
             )
 
@@ -101,25 +106,25 @@ def _read_git_repository(path: Path) -> ProcessedRepository | None:
 
 
 class StoreData(CoreSysAttributes):
-    """Hold data for Add-ons inside Supervisor."""
+    """Hold data for Apps inside Supervisor."""
 
     def __init__(self, coresys: CoreSys):
         """Initialize data holder."""
         self.coresys: CoreSys = coresys
         self.repositories: dict[str, Any] = {}
-        self.addons: dict[str, dict[str, Any]] = {}
+        self.apps: dict[str, dict[str, Any]] = {}
 
     async def update(self) -> None:
-        """Read data from add-on repository."""
+        """Read data from app repository."""
         # read core repository
-        addons = await self._read_addons_folder(
-            self.sys_config.path_addons_core, REPOSITORY_CORE
+        apps = await self._read_apps_folder(
+            self.sys_config.path_apps_core, REPOSITORY_CORE
         )
 
         # read local repository
-        addons.update(
-            await self._read_addons_folder(
-                self.sys_config.path_addons_local, REPOSITORY_LOCAL
+        apps.update(
+            await self._read_apps_folder(
+                self.sys_config.path_apps_local, REPOSITORY_LOCAL
             )
         )
 
@@ -130,45 +135,40 @@ class StoreData(CoreSysAttributes):
         def _read_git_repositories() -> list[ProcessedRepository]:
             return [
                 repo
-                for repository_element in self.sys_config.path_addons_git.iterdir()
+                for repository_element in self.sys_config.path_apps_git.iterdir()
                 if repository_element.is_dir()
                 and (repo := _read_git_repository(repository_element))
             ]
 
         for repo in await self.sys_run_in_executor(_read_git_repositories):
             repositories[repo.slug] = repo.config
-            addons.update(await self._read_addons_folder(repo.path, repo.slug))
+            apps.update(await self._read_apps_folder(repo.path, repo.slug))
 
         self.repositories = repositories
-        self.addons = addons
+        self.apps = apps
 
-    async def _find_addon_configs(
-        self, path: Path, repository: str
-    ) -> list[Path] | None:
-        """Find add-ons in the path."""
+    async def _find_app_configs(self, path: Path, repository: str) -> list[Path] | None:
+        """Find apps in the path."""
 
-        def _get_addons_list() -> list[Path]:
+        def _get_apps_list() -> list[Path]:
             # Generate a list without artefact, safe for corruptions
             return [
-                addon
-                for addon in path.glob("**/config.*")
+                app
+                for app in path.glob("**/config.*")
                 if not [
                     part
-                    for part in addon.parts
+                    for part in app.parts
                     if part.startswith(".") or part == "rootfs"
                 ]
-                and addon.suffix in FILE_SUFFIX_CONFIGURATION
+                and app.suffix in FILE_SUFFIX_CONFIGURATION
             ]
 
         try:
-            addon_list = await self.sys_run_in_executor(_get_addons_list)
+            app_list = await self.sys_run_in_executor(_get_apps_list)
         except OSError as err:
             suggestion = None
-            if err.errno == errno.EBADMSG:
-                self.sys_resolution.add_unhealthy_reason(
-                    UnhealthyReason.OSERROR_BAD_MESSAGE
-                )
-            elif repository != REPOSITORY_LOCAL:
+            self.sys_resolution.check_oserror(err)
+            if err.errno != errno.EBADMSG and repository != REPOSITORY_LOCAL:
                 suggestion = [SuggestionType.EXECUTE_RESET]
             self.sys_resolution.create_issue(
                 IssueType.CORRUPT_REPOSITORY,
@@ -180,48 +180,75 @@ class StoreData(CoreSysAttributes):
                 "Can't process %s because of Filesystem issues: %s", repository, err
             )
             return None
-        return addon_list
+        return app_list
 
-    async def _read_addons_folder(
+    async def _read_apps_folder(
         self, path: Path, repository: str
     ) -> dict[str, dict[str, Any]]:
-        """Read data from add-ons folder."""
-        if not (addon_config_list := await self._find_addon_configs(path, repository)):
+        """Read data from apps folder."""
+        if not (app_config_list := await self._find_app_configs(path, repository)):
             return {}
 
-        def _process_addons_config() -> dict[str, dict[str, Any]]:
-            addons: dict[str, dict[str, Any]] = {}
-            for addon_config in addon_config_list:
+        # App config deprecation/misconfiguration advisories are only actionable
+        # for someone who can fix the app, so only those cases log at warning
+        # level; everything else stays at debug so regular users don't see
+        # warnings for apps they cannot fix. Warn for the local repository
+        # (authored by the user), on the dev channel (a developer testing store
+        # apps), and for installed apps from custom repositories - the latter
+        # are often thin wrappers whose maintainer may have moved on, where the
+        # warning is the user's only heads-up before it breaks. Uninstalled apps
+        # and apps from the curated built-in stores (which get fixed via PRs)
+        # stay quiet.
+        repository_obj = self.sys_store.repositories.get(repository)
+        repository_is_builtin = bool(repository_obj and repository_obj.is_builtin)
+        always_verbose = (
+            repository == REPOSITORY_LOCAL
+            or self.sys_updater.channel == UpdateChannel.DEV
+        )
+        installed_slugs = {app.slug for app in self.sys_apps.installed}
+
+        def _process_apps_config() -> dict[str, dict[str, Any]]:
+            apps: dict[str, dict[str, Any]] = {}
+            for app_config in app_config_list:
                 try:
-                    addon = read_json_or_yaml_file(addon_config)
+                    app = read_json_or_yaml_file(app_config)
                 except ConfigurationFileError:
                     _LOGGER.warning(
-                        "Can't read %s from repository %s", addon_config, repository
+                        "Can't read %s from repository %s", app_config, repository
                     )
                     continue
 
+                # Pick the advisory log level based on who can act on it (see
+                # above). The slug is available in the raw config before
+                # validation.
+                verbose = always_verbose or (
+                    not repository_is_builtin
+                    and f"{repository}_{app.get(ATTR_SLUG)}" in installed_slugs
+                )
+                schema = SCHEMA_APP_CONFIG if verbose else SCHEMA_APP_CONFIG_QUIET
+
                 # validate
                 try:
-                    addon = SCHEMA_ADDON_CONFIG(addon)
+                    app = schema(app)
                 except vol.Invalid as ex:
                     _LOGGER.warning(
-                        "Can't read %s: %s", addon_config, humanize_error(addon, ex)
+                        "Can't read %s: %s", app_config, humanize_error(app, ex)
                     )
                     continue
 
                 # Generate slug
-                addon_slug = f"{repository}_{addon[ATTR_SLUG]}"
+                app_slug = f"{repository}_{app[ATTR_SLUG]}"
 
                 # store
-                addon[ATTR_REPOSITORY] = repository
-                addon[ATTR_LOCATION] = str(addon_config.parent)
-                addon[ATTR_TRANSLATIONS] = _read_addon_translations(addon_config.parent)
-                addon[ATTR_VERSION_TIMESTAMP] = addon_config.stat().st_mtime
-                addons[addon_slug] = addon
+                app[ATTR_REPOSITORY] = repository
+                app[ATTR_LOCATION] = str(app_config.parent)
+                app[ATTR_TRANSLATIONS] = _read_app_translations(app_config.parent)
+                app[ATTR_VERSION_TIMESTAMP] = app_config.stat().st_mtime
+                apps[app_slug] = app
 
-            return addons
+            return apps
 
-        return await self.sys_run_in_executor(_process_addons_config)
+        return await self.sys_run_in_executor(_process_apps_config)
 
     def _get_builtin_repositories(self) -> dict[str, dict[str, str]]:
         """Get local built-in repositories into dataset.

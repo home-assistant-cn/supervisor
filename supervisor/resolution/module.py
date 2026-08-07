@@ -1,13 +1,17 @@
 """Supervisor resolution center."""
 
+from dataclasses import asdict
+import errno
 import logging
 from typing import Any
 
-import attr
-
 from ..bus import EventListener
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import ResolutionError, ResolutionNotFound
+from ..exceptions import (
+    ResolutionError,
+    ResolutionIssueNotFound,
+    ResolutionSuggestionNotFound,
+)
 from ..homeassistant.const import WSEvent
 from ..utils.common import FileConfiguration
 from .check import ResolutionCheck
@@ -23,7 +27,6 @@ from .const import (
 from .data import HealthChanged, Issue, Suggestion, SupportedChanged
 from .evaluate import ResolutionEvaluation
 from .fixup import ResolutionFixup
-from .notify import ResolutionNotify
 from .validate import SCHEMA_RESOLUTION_CONFIG
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -40,12 +43,11 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         self._evaluate = ResolutionEvaluation(coresys)
         self._check = ResolutionCheck(coresys)
         self._fixup = ResolutionFixup(coresys)
-        self._notify = ResolutionNotify(coresys)
 
         self._suggestions: list[Suggestion] = []
         self._issues: list[Issue] = []
-        self._unsupported: list[UnsupportedReason] = []
-        self._unhealthy: list[UnhealthyReason] = []
+        self._unsupported: set[UnsupportedReason] = set()
+        self._unhealthy: set[UnhealthyReason] = set()
 
         # Map suggestion UUID to event listeners (list)
         self._suggestion_listeners: dict[str, list[EventListener]] = {}
@@ -80,11 +82,6 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
     def fixup(self) -> ResolutionFixup:
         """Return the ResolutionFixup class."""
         return self._fixup
-
-    @property
-    def notify(self) -> ResolutionNotify:
-        """Return the ResolutionNotify class."""
-        return self._notify
 
     @property
     def issues(self) -> list[Issue]:
@@ -129,57 +126,87 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
             )
 
     @property
-    def unsupported(self) -> list[UnsupportedReason]:
-        """Return a list of unsupported reasons."""
+    def unsupported(self) -> set[UnsupportedReason]:
+        """Return a set of unsupported reasons."""
         return self._unsupported
 
     def add_unsupported_reason(self, reason: UnsupportedReason) -> None:
         """Add a reason for unsupported."""
-        if reason not in self._unsupported:
-            self._unsupported.append(reason)
-            self.sys_homeassistant.websocket.supervisor_event(
-                WSEvent.SUPPORTED_CHANGED,
-                attr.asdict(SupportedChanged(False, self.unsupported)),
-            )
+        if reason in self._unsupported:
+            return
+        self._unsupported.add(reason)
+        self.sys_homeassistant.websocket.supervisor_event(
+            WSEvent.SUPPORTED_CHANGED,
+            asdict(SupportedChanged(False, sorted(self.unsupported))),
+        )
 
     @property
-    def unhealthy(self) -> list[UnhealthyReason]:
-        """Return a list of unhealthy reasons."""
+    def unhealthy(self) -> set[UnhealthyReason]:
+        """Return a set of unhealthy reasons."""
         return self._unhealthy
 
     def add_unhealthy_reason(self, reason: UnhealthyReason) -> None:
         """Add a reason for unhealthy."""
-        if reason not in self._unhealthy:
-            self._unhealthy.append(reason)
-            self.sys_homeassistant.websocket.supervisor_event(
-                WSEvent.HEALTH_CHANGED,
-                attr.asdict(HealthChanged(False, self.unhealthy)),
-            )
+        if reason in self._unhealthy:
+            return
+        self._unhealthy.add(reason)
+        self.sys_homeassistant.websocket.supervisor_event(
+            WSEvent.HEALTH_CHANGED,
+            asdict(HealthChanged(False, sorted(self.unhealthy))),
+        )
+
+    _OSERROR_UNHEALTHY_REASONS: dict[int, UnhealthyReason] = {
+        errno.EBADMSG: UnhealthyReason.OSERROR_BAD_MESSAGE,
+    }
+
+    def check_oserror(self, err: OSError) -> None:
+        """Check OSError for known filesystem issues and mark system unhealthy.
+
+        Must only be used on OSErrors that are caused by file operation on a
+        local path.
+        """
+        if err.errno in self._OSERROR_UNHEALTHY_REASONS:
+            self.add_unhealthy_reason(self._OSERROR_UNHEALTHY_REASONS[err.errno])
 
     def _make_issue_message(self, issue: Issue) -> dict[str, Any]:
         """Make issue into message for core."""
-        return attr.asdict(issue) | {
+        return asdict(issue) | {
             "suggestions": [
-                attr.asdict(suggestion)
-                for suggestion in self.suggestions_for_issue(issue)
+                asdict(suggestion) for suggestion in self.suggestions_for_issue(issue)
             ]
         }
 
-    def get_suggestion(self, uuid: str) -> Suggestion:
+    def get_suggestion_by_id(self, uuid: str) -> Suggestion:
         """Return suggestion with uuid."""
         for suggestion in self._suggestions:
             if suggestion.uuid != uuid:
                 continue
             return suggestion
-        raise ResolutionNotFound()
+        raise ResolutionSuggestionNotFound(uuid=uuid)
 
-    def get_issue(self, uuid: str) -> Issue:
+    def get_suggestion_if_present(self, suggestion: Suggestion) -> Suggestion | None:
+        """Get suggestion matching provided one if it exists in resolution manager."""
+        for s in self._suggestions:
+            if s != suggestion:
+                continue
+            return s
+        return None
+
+    def get_issue_by_id(self, uuid: str) -> Issue:
         """Return issue with uuid."""
         for issue in self._issues:
             if issue.uuid != uuid:
                 continue
             return issue
-        raise ResolutionNotFound()
+        raise ResolutionIssueNotFound(uuid=uuid)
+
+    def get_issue_if_present(self, issue: Issue) -> Issue | None:
+        """Get issue matching provided one if it exists in resolution manager."""
+        for i in self._issues:
+            if i != issue:
+                continue
+            return i
+        return None
 
     def create_issue(
         self,
@@ -187,9 +214,10 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         context: ContextType,
         reference: str | None = None,
         suggestions: list[SuggestionType] | None = None,
+        reference_extra: dict[str, Any] | None = None,
     ) -> None:
         """Create issues and suggestion."""
-        self.add_issue(Issue(issue, context, reference), suggestions)
+        self.add_issue(Issue(issue, context, reference, reference_extra), suggestions)
 
     def add_issue(
         self, issue: Issue, suggestions: list[SuggestionType] | None = None
@@ -198,7 +226,12 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         if suggestions:
             for suggestion in suggestions:
                 self.add_suggestion(
-                    Suggestion(suggestion, issue.context, issue.reference)
+                    Suggestion(
+                        suggestion,
+                        issue.context,
+                        issue.reference,
+                        issue.reference_extra,
+                    )
                 )
 
         if issue in self._issues:
@@ -214,7 +247,7 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         )
 
     async def load(self):
-        """Load the resoulution manager."""
+        """Load the resolution manager."""
         # Initial healthcheck check
         await self.healthcheck()
 
@@ -229,25 +262,15 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         # Run autofix if possible
         await self.fixup.run_autofix()
 
-        # Create notification for any known issues
-        await self.notify.issue_notifications()
-
     async def apply_suggestion(self, suggestion: Suggestion) -> None:
         """Apply suggested action."""
-        if suggestion not in self._suggestions:
-            raise ResolutionError(
-                f"Suggestion {suggestion.uuid} is not valid", _LOGGER.warning
-            )
-
+        suggestion = self.get_suggestion_by_id(suggestion.uuid)
         await self.fixup.apply_fixup(suggestion)
         await self.healthcheck()
 
     def dismiss_suggestion(self, suggestion: Suggestion) -> None:
         """Dismiss suggested action."""
-        if suggestion not in self._suggestions:
-            raise ResolutionError(
-                f"The UUID {suggestion.uuid} is not valid suggestion", _LOGGER.warning
-            )
+        suggestion = self.get_suggestion_by_id(suggestion.uuid)
         self._suggestions.remove(suggestion)
 
         # Remove event listeners if present
@@ -263,15 +286,12 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
 
     def dismiss_issue(self, issue: Issue) -> None:
         """Dismiss suggested action."""
-        if issue not in self._issues:
-            raise ResolutionError(
-                f"The UUID {issue.uuid} is not a valid issue", _LOGGER.warning
-            )
+        issue = self.get_issue_by_id(issue.uuid)
         self._issues.remove(issue)
 
         # Event on issue removal
         self.sys_homeassistant.websocket.supervisor_event(
-            WSEvent.ISSUE_REMOVED, attr.asdict(issue)
+            WSEvent.ISSUE_REMOVED, asdict(issue)
         )
 
         # Clean up any orphaned suggestions
@@ -286,8 +306,10 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
         self._unsupported.remove(reason)
         self.sys_homeassistant.websocket.supervisor_event(
             WSEvent.SUPPORTED_CHANGED,
-            attr.asdict(
-                SupportedChanged(self.sys_core.supported, self.unsupported or None)
+            asdict(
+                SupportedChanged(
+                    self.sys_core.supported, sorted(self.unsupported) or None
+                )
             ),
         )
 
@@ -298,6 +320,7 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
             for fix in self.fixup.fixes_for_issue(issue)
             for suggestion in fix.all_suggestions
             if suggestion.reference == issue.reference
+            and suggestion.reference_extra == issue.reference_extra
         }
 
     def issues_for_suggestion(self, suggestion: Suggestion) -> set[Issue]:
@@ -307,4 +330,5 @@ class ResolutionManager(FileConfiguration, CoreSysAttributes):
             for fix in self.fixup.fixes_for_suggestion(suggestion)
             for issue in fix.all_issues
             if issue.reference == suggestion.reference
+            and issue.reference_extra == suggestion.reference_extra
         }

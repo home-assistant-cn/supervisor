@@ -1,5 +1,6 @@
 """Connection object for Network Manager."""
 
+from copy import deepcopy
 import logging
 from typing import Any
 
@@ -53,27 +54,25 @@ CONF_ATTR_802_WIRELESS_SECURITY_AUTH_ALG = "auth-alg"
 CONF_ATTR_802_WIRELESS_SECURITY_KEY_MGMT = "key-mgmt"
 CONF_ATTR_802_WIRELESS_SECURITY_PSK = "psk"
 
-CONF_ATTR_IPV4_METHOD = "method"
-CONF_ATTR_IPV4_ADDRESS_DATA = "address-data"
-CONF_ATTR_IPV4_GATEWAY = "gateway"
-CONF_ATTR_IPV4_DNS = "dns"
+CONF_ATTR_IP_METHOD = "method"
+CONF_ATTR_IP_ADDRESS_DATA = "address-data"
+CONF_ATTR_IP_GATEWAY = "gateway"
+CONF_ATTR_IP_ROUTE_METRIC = "route-metric"
+CONF_ATTR_IP_DNS = "dns"
 
-CONF_ATTR_IPV6_METHOD = "method"
 CONF_ATTR_IPV6_ADDR_GEN_MODE = "addr-gen-mode"
 CONF_ATTR_IPV6_PRIVACY = "ip6-privacy"
-CONF_ATTR_IPV6_ADDRESS_DATA = "address-data"
-CONF_ATTR_IPV6_GATEWAY = "gateway"
-CONF_ATTR_IPV6_DNS = "dns"
 
-IPV4_6_IGNORE_FIELDS = [
+_IP_IGNORE_FIELDS = [
+    CONF_ATTR_IP_METHOD,
+    CONF_ATTR_IP_ADDRESS_DATA,
+    CONF_ATTR_IP_GATEWAY,
+    CONF_ATTR_IP_ROUTE_METRIC,
+    CONF_ATTR_IP_DNS,
+    CONF_ATTR_IPV6_ADDR_GEN_MODE,
+    CONF_ATTR_IPV6_PRIVACY,
     "addresses",
-    "address-data",
-    "dns",
     "dns-data",
-    "gateway",
-    "method",
-    "addr-gen-mode",
-    "ip6-privacy",
 ]
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -171,13 +170,19 @@ class NetworkSetting(DBusInterface):
         return await self.connected_dbus.Settings.Connection.call("get_settings")
 
     @dbus_connected
-    async def update(self, settings: dict[str, dict[str, Variant]]) -> None:
-        """Update connection settings."""
-        new_settings: dict[
+    async def update(self, settings: dict[str, dict[str, Variant]]) -> bool:
+        """Update connection settings.
+
+        Return True if the settings as normalized by NetworkManager changed.
+        Secrets (e.g. Wi-Fi PSK) are not part of GetSettings, so a change to
+        secrets only is not detected.
+        """
+        current_settings: dict[
             str, dict[str, Variant]
         ] = await self.connected_dbus.Settings.Connection.call(
             "get_settings", unpack_variants=False
         )
+        new_settings = deepcopy(current_settings)
 
         _merge_settings_attribute(
             new_settings,
@@ -195,17 +200,27 @@ class NetworkSetting(DBusInterface):
             new_settings,
             settings,
             CONF_ATTR_IPV4,
-            ignore_current_value=IPV4_6_IGNORE_FIELDS,
+            ignore_current_value=_IP_IGNORE_FIELDS,
         )
         _merge_settings_attribute(
             new_settings,
             settings,
             CONF_ATTR_IPV6,
-            ignore_current_value=IPV4_6_IGNORE_FIELDS,
+            ignore_current_value=_IP_IGNORE_FIELDS,
         )
         _merge_settings_attribute(new_settings, settings, CONF_ATTR_MATCH)
 
         await self.connected_dbus.Settings.Connection.call("update", new_settings)
+
+        # NetworkManager normalizes the settings on update (e.g. drops
+        # properties at their default value). Comparing its normalized view
+        # before and after tells whether the update actually changed anything.
+        updated_settings: dict[
+            str, dict[str, Variant]
+        ] = await self.connected_dbus.Settings.Connection.call(
+            "get_settings", unpack_variants=False
+        )
+        return current_settings != updated_settings
 
     @dbus_connected
     async def delete(self) -> None:
@@ -291,26 +306,28 @@ class NetworkSetting(DBusInterface):
 
         if CONF_ATTR_IPV4 in data:
             address_data = None
-            if ips := data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_ADDRESS_DATA):
+            if ips := data[CONF_ATTR_IPV4].get(CONF_ATTR_IP_ADDRESS_DATA):
                 address_data = [IpAddress(ip["address"], ip["prefix"]) for ip in ips]
             self._ipv4 = Ip4Properties(
-                method=data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_METHOD),
+                method=data[CONF_ATTR_IPV4].get(CONF_ATTR_IP_METHOD),
                 address_data=address_data,
-                gateway=data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_GATEWAY),
-                dns=data[CONF_ATTR_IPV4].get(CONF_ATTR_IPV4_DNS),
+                gateway=data[CONF_ATTR_IPV4].get(CONF_ATTR_IP_GATEWAY),
+                route_metric=data[CONF_ATTR_IPV4].get(CONF_ATTR_IP_ROUTE_METRIC),
+                dns=data[CONF_ATTR_IPV4].get(CONF_ATTR_IP_DNS),
             )
 
         if CONF_ATTR_IPV6 in data:
             address_data = None
-            if ips := data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_ADDRESS_DATA):
+            if ips := data[CONF_ATTR_IPV6].get(CONF_ATTR_IP_ADDRESS_DATA):
                 address_data = [IpAddress(ip["address"], ip["prefix"]) for ip in ips]
             self._ipv6 = Ip6Properties(
-                method=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_METHOD),
+                method=data[CONF_ATTR_IPV6].get(CONF_ATTR_IP_METHOD),
                 addr_gen_mode=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_ADDR_GEN_MODE),
                 ip6_privacy=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_PRIVACY),
                 address_data=address_data,
-                gateway=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_GATEWAY),
-                dns=data[CONF_ATTR_IPV6].get(CONF_ATTR_IPV6_DNS),
+                gateway=data[CONF_ATTR_IPV6].get(CONF_ATTR_IP_GATEWAY),
+                route_metric=data[CONF_ATTR_IPV6].get(CONF_ATTR_IP_ROUTE_METRIC),
+                dns=data[CONF_ATTR_IPV6].get(CONF_ATTR_IP_DNS),
             )
 
         if CONF_ATTR_MATCH in data:

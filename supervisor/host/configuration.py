@@ -6,8 +6,8 @@ import logging
 import socket
 
 from ..dbus.const import (
+    ConnectionState,
     ConnectionStateFlags,
-    ConnectionStateType,
     DeviceType,
     InterfaceAddrGenMode as NMInterfaceAddrGenMode,
     InterfaceIp6Privacy as NMInterfaceIp6Privacy,
@@ -64,6 +64,7 @@ class IpSetting:
     method: InterfaceMethod
     address: list[IPv4Interface | IPv6Interface]
     gateway: IPv4Address | IPv6Address | None
+    route_metric: int | None
     nameservers: list[IPv4Address | IPv6Address]
 
 
@@ -152,7 +153,7 @@ class Interface:
         )
 
     @staticmethod
-    def from_dbus_interface(inet: NetworkInterface) -> "Interface":
+    def from_dbus_interface(inet: NetworkInterface) -> Interface:
         """Coerce a dbus interface into normal Interface."""
         if inet.settings and inet.settings.ipv4:
             ipv4_setting = IpSetting(
@@ -166,6 +167,7 @@ class Interface:
                 gateway=IPv4Address(inet.settings.ipv4.gateway)
                 if inet.settings.ipv4.gateway
                 else None,
+                route_metric=inet.settings.ipv4.route_metric,
                 nameservers=[
                     IPv4Address(socket.ntohl(ip)) for ip in inet.settings.ipv4.dns
                 ]
@@ -173,7 +175,7 @@ class Interface:
                 else [],
             )
         else:
-            ipv4_setting = IpSetting(InterfaceMethod.DISABLED, [], None, [])
+            ipv4_setting = IpSetting(InterfaceMethod.DISABLED, [], None, None, [])
 
         if inet.settings and inet.settings.ipv6:
             ipv6_setting = Ip6Setting(
@@ -193,12 +195,13 @@ class Interface:
                 gateway=IPv6Address(inet.settings.ipv6.gateway)
                 if inet.settings.ipv6.gateway
                 else None,
+                route_metric=inet.settings.ipv6.route_metric,
                 nameservers=[IPv6Address(bytes(ip)) for ip in inet.settings.ipv6.dns]
                 if inet.settings.ipv6.dns
                 else [],
             )
         else:
-            ipv6_setting = Ip6Setting(InterfaceMethod.DISABLED, [], None, [])
+            ipv6_setting = Ip6Setting(InterfaceMethod.DISABLED, [], None, None, [])
 
         ipv4_ready = (
             inet.connection is not None
@@ -264,27 +267,50 @@ class Interface:
                 return InterfaceMethod.AUTO
             case NMInterfaceMethod.MANUAL:
                 return InterfaceMethod.STATIC
-        return InterfaceMethod.DISABLED
+            case _:
+                return InterfaceMethod.DISABLED
 
     @staticmethod
-    def _map_nm_addr_gen_mode(addr_gen_mode: int) -> InterfaceAddrGenMode:
-        """Map IPv6 interface addr_gen_mode."""
+    def _map_nm_addr_gen_mode(addr_gen_mode: int | None) -> InterfaceAddrGenMode:
+        """Map IPv6 interface addr_gen_mode.
+
+        NetworkManager omits the addr_gen_mode property when set to DEFAULT, so we
+        treat None as DEFAULT here.
+        """
         mapping = {
             NMInterfaceAddrGenMode.EUI64.value: InterfaceAddrGenMode.EUI64,
             NMInterfaceAddrGenMode.STABLE_PRIVACY.value: InterfaceAddrGenMode.STABLE_PRIVACY,
             NMInterfaceAddrGenMode.DEFAULT_OR_EUI64.value: InterfaceAddrGenMode.DEFAULT_OR_EUI64,
+            NMInterfaceAddrGenMode.DEFAULT.value: InterfaceAddrGenMode.DEFAULT,
+            None: InterfaceAddrGenMode.DEFAULT,
         }
+
+        if addr_gen_mode not in mapping:
+            _LOGGER.warning(
+                "Unknown addr_gen_mode value from NetworkManager: %s", addr_gen_mode
+            )
 
         return mapping.get(addr_gen_mode, InterfaceAddrGenMode.DEFAULT)
 
     @staticmethod
-    def _map_nm_ip6_privacy(ip6_privacy: int) -> InterfaceIp6Privacy:
-        """Map IPv6 interface ip6_privacy."""
+    def _map_nm_ip6_privacy(ip6_privacy: int | None) -> InterfaceIp6Privacy:
+        """Map IPv6 interface ip6_privacy.
+
+        NetworkManager omits the ip6_privacy property when set to DEFAULT, so we
+        treat None as DEFAULT here.
+        """
         mapping = {
             NMInterfaceIp6Privacy.DISABLED.value: InterfaceIp6Privacy.DISABLED,
             NMInterfaceIp6Privacy.ENABLED_PREFER_PUBLIC.value: InterfaceIp6Privacy.ENABLED_PREFER_PUBLIC,
             NMInterfaceIp6Privacy.ENABLED.value: InterfaceIp6Privacy.ENABLED,
+            NMInterfaceIp6Privacy.DEFAULT.value: InterfaceIp6Privacy.DEFAULT,
+            None: InterfaceIp6Privacy.DEFAULT,
         }
+
+        if ip6_privacy not in mapping:
+            _LOGGER.warning(
+                "Unknown ip6_privacy value from NetworkManager: %s", ip6_privacy
+            )
 
         return mapping.get(ip6_privacy, InterfaceIp6Privacy.DEFAULT)
 
@@ -295,8 +321,8 @@ class Interface:
             return False
 
         return connection.state in (
-            ConnectionStateType.ACTIVATED,
-            ConnectionStateType.ACTIVATING,
+            ConnectionState.ACTIVATED,
+            ConnectionState.ACTIVATING,
         )
 
     @staticmethod
@@ -308,7 +334,8 @@ class Interface:
                 return InterfaceType.WIRELESS
             case DeviceType.VLAN.value:
                 return InterfaceType.VLAN
-        raise ValueError(f"Invalid device type: {device_type}")
+            case _:
+                raise ValueError(f"Invalid device type: {device_type}")
 
     @staticmethod
     def _map_nm_wifi(inet: NetworkInterface) -> WifiConfig | None:

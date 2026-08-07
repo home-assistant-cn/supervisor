@@ -20,7 +20,7 @@ async def fixture_device_eth0_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> DeviceService:
     """Mock Device eth0 service."""
-    yield network_manager_services["network_device"][
+    return network_manager_services["network_device"][
         "/org/freedesktop/NetworkManager/Devices/1"
     ]
 
@@ -30,7 +30,7 @@ async def fixture_device_wlan0_service(
     network_manager_services: dict[str, DBusServiceMock | dict[str, DBusServiceMock]],
 ) -> DeviceService:
     """Mock Device wlan0 service."""
-    yield network_manager_services["network_device"][
+    return network_manager_services["network_device"][
         "/org/freedesktop/NetworkManager/Devices/3"
     ]
 
@@ -40,7 +40,7 @@ async def fixture_device_unmanaged_service(
     dbus_session_bus: MessageBus,
 ) -> DeviceService:
     """Mock Device unmanaged service."""
-    yield (
+    return (
         await mock_dbus_services(
             {"network_device": "/org/freedesktop/NetworkManager/Devices/35"},
             dbus_session_bus,
@@ -95,6 +95,21 @@ async def test_network_interface_ethernet(
     await device_eth0_service.ping()
     await device_eth0_service.ping()
     assert interface.managed is True
+
+
+async def test_reapply(
+    device_eth0_service: DeviceService, dbus_session_bus: MessageBus
+):
+    """Test reapply on network interface."""
+    device_eth0_service.Reapply.calls.clear()
+
+    interface = NetworkInterface("/org/freedesktop/NetworkManager/Devices/1")
+    await interface.connect(dbus_session_bus)
+
+    await interface.reapply()
+    assert device_eth0_service.Reapply.calls == [
+        ("/org/freedesktop/NetworkManager/Devices/1", {}, 0, 0)
+    ]
 
 
 async def test_network_interface_wlan(
@@ -184,3 +199,21 @@ async def test_interface_becomes_unmanaged(
     assert wireless.is_connected is False
     assert eth0.connection is None
     assert connection.is_connected is False
+
+
+async def test_unknown_device_type(
+    device_eth0_service: DeviceService, dbus_session_bus: MessageBus
+):
+    """Test unknown device types are handled gracefully."""
+    interface = NetworkInterface("/org/freedesktop/NetworkManager/Devices/1")
+    await interface.connect(dbus_session_bus)
+
+    # Emit an unknown device type (e.g., 1000 which doesn't exist in the enum)
+    device_eth0_service.emit_properties_changed({"DeviceType": 1000})
+    await device_eth0_service.ping()
+
+    # Should preserve the actual value as a pseudo-member instead of crashing
+    assert isinstance(interface.type, DeviceType)
+    assert interface.type == 1000
+    # Wireless should be None since it's not a wireless device
+    assert interface.wireless is None

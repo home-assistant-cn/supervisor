@@ -13,6 +13,8 @@ from supervisor.dbus.const import DBUS_OBJECT_BASE
 from supervisor.exceptions import (
     DBusFatalError,
     DBusInterfaceError,
+    DBusInterfaceMethodError,
+    DBusInvalidArgsError,
     DBusServiceUnkownError,
 )
 from supervisor.utils.dbus import DBus
@@ -29,7 +31,7 @@ class TestInterface(DBusServiceMock):
     object_path = DBUS_OBJECT_BASE
 
     @method(name="Test")
-    def test(self, _: "b") -> None:  # noqa: F821
+    def test(self, _: "b") -> None:  # noqa: F821, UP037
         """Do Test method."""
 
     @signal(name="Test")
@@ -43,7 +45,7 @@ async def fixture_test_service(dbus_session_bus: MessageBus) -> TestInterface:
     await dbus_session_bus.request_name("service.test.TestInterface")
     service = TestInterface()
     service.export(dbus_session_bus)
-    yield service
+    return service
 
 
 async def test_missing_properties_interface(dbus_session_bus: MessageBus):
@@ -190,3 +192,18 @@ def test_from_dbus_error():
     )
 
     assert type(DBus.from_dbus_error(dbus_fast_error)) is DBusServiceUnkownError
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected"),
+    [
+        (ErrorType.UNKNOWN_METHOD, DBusInterfaceMethodError),
+        (ErrorType.INVALID_SIGNATURE, DBusInterfaceMethodError),
+        (ErrorType.INVALID_ARGS, DBusInvalidArgsError),
+    ],
+)
+def test_from_dbus_error_method_vs_args(
+    error_type: ErrorType, expected: type[Exception]
+):
+    """INVALID_ARGS must not collapse into DBusInterfaceMethodError."""
+    assert type(DBus.from_dbus_error(DBusFastDBusError(error_type, "boom"))) is expected

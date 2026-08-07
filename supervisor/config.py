@@ -9,12 +9,13 @@ from pathlib import Path, PurePath
 from awesomeversion import AwesomeVersion
 
 from .const import (
-    ATTR_ADDONS_CUSTOM_LIST,
+    ATTR_APPS_CUSTOM_LIST,
     ATTR_COUNTRY,
     ATTR_DEBUG,
     ATTR_DEBUG_BLOCK,
     ATTR_DETECT_BLOCKING_IO,
     ATTR_DIAGNOSTICS,
+    ATTR_FEATURE_FLAGS,
     ATTR_IMAGE,
     ATTR_LAST_BOOT,
     ATTR_LOGGING,
@@ -24,6 +25,7 @@ from .const import (
     ENV_SUPERVISOR_SHARE,
     FILE_HASSIO_CONFIG,
     SUPERVISOR_DATA,
+    FeatureFlag,
     LogLevel,
 )
 from .utils.common import FileConfiguration
@@ -36,10 +38,10 @@ HOMEASSISTANT_CONFIG = PurePath("homeassistant")
 
 HASSIO_SSL = PurePath("ssl")
 
-ADDONS_CORE = PurePath("addons/core")
-ADDONS_LOCAL = PurePath("addons/local")
-ADDONS_GIT = PurePath("addons/git")
-ADDONS_DATA = PurePath("addons/data")
+APPS_CORE = PurePath("apps/core")
+APPS_DATA = PurePath("apps/data")
+APPS_LOCAL = PurePath("apps/local")
+APPS_GIT = PurePath("apps/git")
 
 BACKUP_DATA = PurePath("backup")
 SHARE_DATA = PurePath("share")
@@ -52,15 +54,15 @@ MEDIA_DATA = PurePath("media")
 MOUNTS_FOLDER = PurePath("mounts")
 MOUNTS_CREDENTIALS = PurePath(".mounts_credentials")
 EMERGENCY_DATA = PurePath("emergency")
-ADDON_CONFIGS = PurePath("addon_configs")
+APP_CONFIGS = PurePath("app_configs")
 CORE_BACKUP_DATA = PurePath("core/backup")
 CID_FILES = PurePath("cid_files")
 
 DEFAULT_BOOT_TIME = datetime.fromtimestamp(0, UTC).isoformat()
 
 # We filter out UTC because it's the system default fallback
-# Core also not respect the cotnainer timezone and reset timezones
-# to UTC if the user overflight the onboarding.
+# Core also does not respect the container timezone and resets timezones
+# to UTC if the user skimmed through the onboarding.
 _UTC = "UTC"
 
 
@@ -196,6 +198,17 @@ class CoreConfig(FileConfiguration):
         logging.getLogger("supervisor").setLevel(lvl)
 
     @property
+    def feature_flags(self) -> dict[FeatureFlag, bool]:
+        """Return current state of explicitly configured experimental feature flags."""
+        return self._data.get(ATTR_FEATURE_FLAGS, {})
+
+    def set_feature_flag(self, feature: FeatureFlag, enabled: bool) -> None:
+        """Enable or disable an experimental feature flag."""
+        if ATTR_FEATURE_FLAGS not in self._data:
+            self._data[ATTR_FEATURE_FLAGS] = {}
+        self._data[ATTR_FEATURE_FLAGS][feature] = enabled
+
+    @property
     def last_boot(self) -> datetime:
         """Return last boot datetime."""
         boot_str = self._data.get(ATTR_LAST_BOOT, DEFAULT_BOOT_TIME)
@@ -241,44 +254,44 @@ class CoreConfig(FileConfiguration):
         return self.path_supervisor / HASSIO_SSL
 
     @property
-    def path_addons_core(self) -> Path:
-        """Return git path for core Add-ons."""
-        return self.path_supervisor / ADDONS_CORE
+    def path_apps_core(self) -> Path:
+        """Return git path for core Apps."""
+        return self.path_supervisor / APPS_CORE
 
     @property
-    def path_addons_git(self) -> Path:
-        """Return path for Git Add-on."""
-        return self.path_supervisor / ADDONS_GIT
+    def path_apps_git(self) -> Path:
+        """Return path for Git App."""
+        return self.path_supervisor / APPS_GIT
 
     @property
-    def path_addons_local(self) -> Path:
-        """Return path for custom Add-ons."""
-        return self.path_supervisor / ADDONS_LOCAL
+    def path_apps_local(self) -> Path:
+        """Return path for custom Apps."""
+        return self.path_supervisor / APPS_LOCAL
 
     @property
-    def path_extern_addons_local(self) -> PurePath:
-        """Return path for custom Add-ons."""
-        return PurePath(self.path_extern_supervisor, ADDONS_LOCAL)
+    def path_extern_apps_local(self) -> PurePath:
+        """Return path for custom Apps."""
+        return PurePath(self.path_extern_supervisor, APPS_LOCAL)
 
     @property
-    def path_addons_data(self) -> Path:
-        """Return root Add-on data folder."""
-        return self.path_supervisor / ADDONS_DATA
+    def path_apps_data(self) -> Path:
+        """Return root App data folder."""
+        return self.path_supervisor / APPS_DATA
 
     @property
-    def path_extern_addons_data(self) -> PurePath:
-        """Return root add-on data folder external for Docker."""
-        return PurePath(self.path_extern_supervisor, ADDONS_DATA)
+    def path_extern_apps_data(self) -> PurePath:
+        """Return root app data folder external for Docker."""
+        return PurePath(self.path_extern_supervisor, APPS_DATA)
 
     @property
-    def path_addon_configs(self) -> Path:
-        """Return root Add-on configs folder."""
-        return self.path_supervisor / ADDON_CONFIGS
+    def path_app_configs(self) -> Path:
+        """Return root App configs folder."""
+        return self.path_supervisor / APP_CONFIGS
 
     @property
-    def path_extern_addon_configs(self) -> PurePath:
-        """Return root Add-on configs folder external for Docker."""
-        return PurePath(self.path_extern_supervisor, ADDON_CONFIGS)
+    def path_extern_app_configs(self) -> PurePath:
+        """Return root App configs folder external for Docker."""
+        return PurePath(self.path_extern_supervisor, APP_CONFIGS)
 
     @property
     def path_audio(self) -> Path:
@@ -411,23 +424,23 @@ class CoreConfig(FileConfiguration):
         return PurePath(self.path_extern_supervisor, CID_FILES)
 
     @property
-    def addons_repositories(self) -> list[str]:
-        """Return list of custom Add-on repositories."""
-        return self._data[ATTR_ADDONS_CUSTOM_LIST]
+    def apps_repositories(self) -> list[str]:
+        """Return list of custom App repositories."""
+        return self._data[ATTR_APPS_CUSTOM_LIST]
 
-    def add_addon_repository(self, repo: str) -> None:
+    def add_app_repository(self, repo: str) -> None:
         """Add a custom repository to list."""
-        if repo in self._data[ATTR_ADDONS_CUSTOM_LIST]:
+        if repo in self._data[ATTR_APPS_CUSTOM_LIST]:
             return
 
-        self._data[ATTR_ADDONS_CUSTOM_LIST].append(repo)
+        self._data[ATTR_APPS_CUSTOM_LIST].append(repo)
 
-    def drop_addon_repository(self, repo: str) -> None:
+    def drop_app_repository(self, repo: str) -> None:
         """Remove a custom repository from list."""
-        if repo not in self._data[ATTR_ADDONS_CUSTOM_LIST]:
+        if repo not in self._data[ATTR_APPS_CUSTOM_LIST]:
             return
 
-        self._data[ATTR_ADDONS_CUSTOM_LIST].remove(repo)
+        self._data[ATTR_APPS_CUSTOM_LIST].remove(repo)
 
     def local_to_extern_path(self, path: PurePath) -> PurePath:
         """Translate a path relative to supervisor data in the container to its extern path."""

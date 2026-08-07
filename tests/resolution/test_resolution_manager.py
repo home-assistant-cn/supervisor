@@ -34,7 +34,6 @@ def test_properies_unhealthy(coresys: CoreSys):
     assert not coresys.core.healthy
 
 
-@pytest.mark.asyncio
 async def test_resolution_dismiss_suggestion(coresys: CoreSys):
     """Test resolution manager suggestion apply api."""
     coresys.resolution.add_suggestion(
@@ -49,7 +48,6 @@ async def test_resolution_dismiss_suggestion(coresys: CoreSys):
         coresys.resolution.dismiss_suggestion(clear_backup)
 
 
-@pytest.mark.asyncio
 async def test_resolution_apply_suggestion(coresys: CoreSys):
     """Test resolution manager suggestion apply api."""
     coresys.resolution.add_suggestion(
@@ -79,7 +77,6 @@ async def test_resolution_apply_suggestion(coresys: CoreSys):
         await coresys.resolution.apply_suggestion(clear_backup)
 
 
-@pytest.mark.asyncio
 async def test_resolution_dismiss_issue(coresys: CoreSys):
     """Test resolution manager issue apply api."""
     coresys.resolution.add_issue(
@@ -94,7 +91,6 @@ async def test_resolution_dismiss_issue(coresys: CoreSys):
         coresys.resolution.dismiss_issue(updated_failed)
 
 
-@pytest.mark.asyncio
 async def test_resolution_create_issue_suggestion(coresys: CoreSys):
     """Test resolution manager issue and suggestion."""
     coresys.resolution.create_issue(
@@ -112,7 +108,6 @@ async def test_resolution_create_issue_suggestion(coresys: CoreSys):
     assert coresys.resolution.suggestions[-1].context == ContextType.CORE
 
 
-@pytest.mark.asyncio
 async def test_resolution_dismiss_unsupported(coresys: CoreSys):
     """Test resolution manager dismiss unsupported reason."""
     coresys.resolution.add_unsupported_reason(UnsupportedReason.SOFTWARE)
@@ -226,12 +221,14 @@ async def test_events_on_issue_changes(
         "type": "corrupt_repository",
         "context": "store",
         "reference": "test_repo",
+        "reference_extra": None,
         "uuid": issue.uuid,
     }
     suggestion_expected = {
         "type": "execute_reset",
         "context": "store",
         "reference": "test_repo",
+        "reference_extra": None,
         "uuid": suggestion.uuid,
     }
     assert _supervisor_event_message(
@@ -262,6 +259,7 @@ async def test_events_on_issue_changes(
         "type": "execute_remove",
         "context": "store",
         "reference": "test_repo",
+        "reference_extra": None,
         "uuid": execute_remove.uuid,
     } in sent_data["data"]["data"]["suggestions"]
 
@@ -273,9 +271,15 @@ async def test_events_on_issue_changes(
         "issue_changed", issue_expected | {"suggestions": [suggestion_expected]}
     ) in [call.args[0] for call in ha_ws_client.async_send_command.call_args_list]
 
-    # Applying a suggestion should only fire an issue removed event
+    # Applying a suggestion should only fire an issue removed event.
+    # Mock healthcheck to avoid running the system-checks fan-out, which is
+    # not relevant to this assertion (ISSUE_REMOVED is fired by dismiss_issue
+    # inside the fixup, before apply_suggestion calls healthcheck).
     ha_ws_client.async_send_command.reset_mock()
-    with patch("shutil.disk_usage", return_value=(42, 42, 2 * (1024.0**3))):
+    with (
+        patch("shutil.disk_usage", return_value=(42, 42, 2 * (1024.0**3))),
+        patch.object(coresys.resolution, "healthcheck", new_callable=AsyncMock),
+    ):
         await coresys.resolution.apply_suggestion(suggestion)
 
     await asyncio.sleep(0)
@@ -312,13 +316,13 @@ async def test_resolution_apply_suggestion_multiple_copies(coresys: CoreSys):
 async def test_events_on_unsupported_changed(coresys: CoreSys):
     """Test events fired when unsupported changes."""
     with patch.object(
-        type(coresys.homeassistant.websocket), "async_send_message"
+        type(coresys.homeassistant.websocket), "_async_send_command"
     ) as send_message:
         # Marking system as unsupported tells HA
-        assert coresys.resolution.unsupported == []
+        assert coresys.resolution.unsupported == set()
         coresys.resolution.add_unsupported_reason(UnsupportedReason.CONNECTIVITY_CHECK)
         await asyncio.sleep(0)
-        assert coresys.resolution.unsupported == [UnsupportedReason.CONNECTIVITY_CHECK]
+        assert coresys.resolution.unsupported == {UnsupportedReason.CONNECTIVITY_CHECK}
         send_message.assert_called_once_with(
             _supervisor_event_message(
                 "supported_changed",
@@ -330,16 +334,16 @@ async def test_events_on_unsupported_changed(coresys: CoreSys):
         send_message.reset_mock()
         coresys.resolution.add_unsupported_reason(UnsupportedReason.CONNECTIVITY_CHECK)
         await asyncio.sleep(0)
-        assert coresys.resolution.unsupported == [UnsupportedReason.CONNECTIVITY_CHECK]
+        assert coresys.resolution.unsupported == {UnsupportedReason.CONNECTIVITY_CHECK}
         send_message.assert_not_called()
 
         # Adding and removing additional reasons tells HA unsupported reasons changed
         coresys.resolution.add_unsupported_reason(UnsupportedReason.JOB_CONDITIONS)
         await asyncio.sleep(0)
-        assert coresys.resolution.unsupported == [
+        assert coresys.resolution.unsupported == {
             UnsupportedReason.CONNECTIVITY_CHECK,
             UnsupportedReason.JOB_CONDITIONS,
-        ]
+        }
         send_message.assert_called_once_with(
             _supervisor_event_message(
                 "supported_changed",
@@ -353,7 +357,7 @@ async def test_events_on_unsupported_changed(coresys: CoreSys):
         send_message.reset_mock()
         coresys.resolution.dismiss_unsupported(UnsupportedReason.CONNECTIVITY_CHECK)
         await asyncio.sleep(0)
-        assert coresys.resolution.unsupported == [UnsupportedReason.JOB_CONDITIONS]
+        assert coresys.resolution.unsupported == {UnsupportedReason.JOB_CONDITIONS}
         send_message.assert_called_once_with(
             _supervisor_event_message(
                 "supported_changed",
@@ -365,7 +369,7 @@ async def test_events_on_unsupported_changed(coresys: CoreSys):
         send_message.reset_mock()
         coresys.resolution.dismiss_unsupported(UnsupportedReason.JOB_CONDITIONS)
         await asyncio.sleep(0)
-        assert coresys.resolution.unsupported == []
+        assert coresys.resolution.unsupported == set()
         send_message.assert_called_once_with(
             _supervisor_event_message(
                 "supported_changed", {"supported": True, "unsupported_reasons": None}
@@ -376,13 +380,13 @@ async def test_events_on_unsupported_changed(coresys: CoreSys):
 async def test_events_on_unhealthy_changed(coresys: CoreSys):
     """Test events fired when unhealthy changes."""
     with patch.object(
-        type(coresys.homeassistant.websocket), "async_send_message"
+        type(coresys.homeassistant.websocket), "_async_send_command"
     ) as send_message:
         # Marking system as unhealthy tells HA
-        assert coresys.resolution.unhealthy == []
+        assert coresys.resolution.unhealthy == set()
         coresys.resolution.add_unhealthy_reason(UnhealthyReason.DOCKER)
         await asyncio.sleep(0)
-        assert coresys.resolution.unhealthy == [UnhealthyReason.DOCKER]
+        assert coresys.resolution.unhealthy == {UnhealthyReason.DOCKER}
         send_message.assert_called_once_with(
             _supervisor_event_message(
                 "health_changed",
@@ -394,16 +398,16 @@ async def test_events_on_unhealthy_changed(coresys: CoreSys):
         send_message.reset_mock()
         coresys.resolution.add_unhealthy_reason(UnhealthyReason.DOCKER)
         await asyncio.sleep(0)
-        assert coresys.resolution.unhealthy == [UnhealthyReason.DOCKER]
+        assert coresys.resolution.unhealthy == {UnhealthyReason.DOCKER}
         send_message.assert_not_called()
 
         # Adding an additional reason tells HA unhealthy reasons changed
         coresys.resolution.add_unhealthy_reason(UnhealthyReason.UNTRUSTED)
         await asyncio.sleep(0)
-        assert coresys.resolution.unhealthy == [
+        assert coresys.resolution.unhealthy == {
             UnhealthyReason.DOCKER,
             UnhealthyReason.UNTRUSTED,
-        ]
+        }
         send_message.assert_called_once_with(
             _supervisor_event_message(
                 "health_changed",
@@ -415,7 +419,7 @@ async def test_events_on_unhealthy_changed(coresys: CoreSys):
 async def test_dismiss_issue_removes_orphaned_suggestions(coresys: CoreSys):
     """Test dismissing an issue also removes any suggestions which have been orphaned."""
     with patch.object(
-        type(coresys.homeassistant.websocket), "async_send_message"
+        type(coresys.homeassistant.websocket), "_async_send_command"
     ) as send_message:
         coresys.resolution.create_issue(
             IssueType.MOUNT_FAILED,
@@ -445,6 +449,7 @@ async def test_dismiss_issue_removes_orphaned_suggestions(coresys: CoreSys):
                     "type": "mount_failed",
                     "context": "mount",
                     "reference": "test",
+                    "reference_extra": None,
                     "uuid": issue.uuid,
                 },
             )

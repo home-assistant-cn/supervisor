@@ -7,7 +7,12 @@ from awesomeversion import AwesomeVersion
 import pytest
 
 from supervisor.const import SUPERVISOR_VERSION, CoreState
-from supervisor.exceptions import AddonConfigurationError
+from supervisor.exceptions import (
+    AppConfigurationError,
+    DockerHubRateLimitExceeded,
+    GithubContainerRegistryRateLimitExceeded,
+    SupervisorUpdateError,
+)
 from supervisor.misc.filter import filter_data
 from supervisor.resolution.const import (
     ContextType,
@@ -66,7 +71,7 @@ SAMPLE_EVENT_AIOHTTP_EXTERNAL = {
             "Sec-WebSocket-Key": "BD239eBT8pDIxStE6QO+Qw==",
             "Sec-WebSocket-Protocol": "tty",
             "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "http://debian-supervised-dev.lan:8123/somehwere",
+            "Referer": "http://debian-supervised-dev.lan:8123/somewhere",
         },
         "data": None,
     },
@@ -81,9 +86,26 @@ def sys_env(autouse=True):
         yield
 
 
-def test_ignored_exception(coresys):
-    """Test ignored exceptions."""
-    hint = {"exc_info": (None, AddonConfigurationError(), None)}
+def _wrap(cause: BaseException, outer: BaseException) -> BaseException:
+    """Attach cause to outer exception (mimicking `raise outer from cause`)."""
+    outer.__cause__ = cause
+    return outer
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        AppConfigurationError(),
+        DockerHubRateLimitExceeded(),
+        GithubContainerRegistryRateLimitExceeded(),
+        # Rate limits are wrapped by supervisor.update() - filter should
+        # still drop them via the __cause__ chain walk.
+        _wrap(DockerHubRateLimitExceeded(), SupervisorUpdateError("update failed")),
+    ],
+)
+def test_ignored_exception(coresys, exc):
+    """Test exceptions that should not be sent to Sentry."""
+    hint = {"exc_info": (type(exc), exc, None)}
     assert filter_data(coresys, SAMPLE_EVENT, hint) is None
 
 
@@ -121,10 +143,15 @@ async def test_not_started(coresys):
     assert "versions" in filtered["contexts"]
     assert "docker" in filtered["contexts"]["versions"]
     assert "supervisor" in filtered["contexts"]["versions"]
+    assert "docker" in filtered["contexts"]
+    assert "storage_driver" in filtered["contexts"]["docker"]
     assert "host" in filtered["contexts"]
     assert "machine" in filtered["contexts"]["host"]
     assert filtered["contexts"]["versions"]["docker"] == coresys.docker.info.version
     assert filtered["contexts"]["versions"]["supervisor"] == coresys.supervisor.version
+    assert (
+        filtered["contexts"]["docker"]["storage_driver"] == coresys.docker.info.storage
+    )
     assert filtered["contexts"]["host"]["machine"] == coresys.machine
 
 
@@ -142,7 +169,54 @@ async def test_defaults(coresys):
     assert filtered["contexts"]["versions"]["supervisor"] == AwesomeVersion(
         SUPERVISOR_VERSION
     )
+    assert (
+        filtered["contexts"]["docker"]["storage_driver"] == coresys.docker.info.storage
+    )
     assert filtered["user"]["id"] == coresys.machine_id
+
+
+async def test_sanitize_url_credentials(coresys):
+    """Test that URL credentials are removed from event strings."""
+    coresys.config.diagnostics = True
+
+    event = {
+        "exception": {
+            "values": [
+                {
+                    "type": "StoreGitCloneError",
+                    "value": "Can't clone https://x-access-token:github_pat_secret@github.com/example/repo repository",
+                }
+            ]
+        },
+        "logentry": {
+            "message": "Can't add repository %s due to %s",
+            "params": ["https://user:pass@example.com/repo", "error"],
+        },
+        "breadcrumbs": {
+            "values": [
+                {
+                    "message": "Cloning app repository from https://user:pass@example.com/repo"
+                }
+            ]
+        },
+    }
+
+    await coresys.core.set_state(CoreState.RUNNING)
+    with patch("shutil.disk_usage", return_value=(42, 42, 2 * (1024.0**3))):
+        filtered = filter_data(coresys, event, {})
+
+    assert (
+        filtered["exception"]["values"][0]["value"]
+        == "Can't clone https://github.com/example/repo repository"
+    )
+    assert filtered["logentry"]["params"] == [
+        "https://example.com/repo",
+        "error",
+    ]
+    assert (
+        filtered["breadcrumbs"]["values"][0]["message"]
+        == "Cloning app repository from https://example.com/repo"
+    )
 
 
 async def test_sanitize_user_hostname(coresys):
@@ -231,7 +305,7 @@ async def test_unhealthy_on_report(coresys):
         event = filter_data(coresys, SAMPLE_EVENT, {})
 
     assert "issues" in event["contexts"]["resolution"]
-    assert event["contexts"]["resolution"]["unhealthy"][-1] == UnhealthyReason.DOCKER
+    assert UnhealthyReason.DOCKER in event["contexts"]["resolution"]["unhealthy"]
 
 
 async def test_images_report(coresys):

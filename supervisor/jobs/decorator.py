@@ -285,7 +285,7 @@ class Job(CoreSysAttributes):
                 # Handle execution limits using context manager
                 async with self._concurrency_control(job_group, job):
                     if not await self._handle_throttling(group_name):
-                        return  # Job was throttled, exit early
+                        return None  # Job was throttled, exit early
 
                     # Execute Job
                     with job.start():
@@ -309,7 +309,7 @@ class Job(CoreSysAttributes):
                             _LOGGER.exception("Unhandled exception: %s", err)
                             job.capture_error()
                             await async_capture_exception(err)
-                            raise JobException() from err
+                            raise JobException from err
 
             # Jobs that weren't started are always cleaned up. Also clean up done jobs if required
             finally:
@@ -372,7 +372,10 @@ class Job(CoreSysAttributes):
             )
 
         if JobCondition.INTERNET_SYSTEM in used_conditions:
-            await coresys.sys_supervisor.check_connectivity()
+            # Precondition wants a recent result, not necessarily a fresh one;
+            # the min-interval short-circuit inside check_and_update_connectivity
+            # reuses the cached state when it's still within window.
+            await coresys.sys_supervisor.check_and_update_connectivity()
             if not coresys.sys_supervisor.connectivity:
                 raise JobConditionException(
                     f"'{method_name}' blocked from execution, no supervisor internet connection"
@@ -441,6 +444,14 @@ class Job(CoreSysAttributes):
             raise JobConditionException(
                 f"'{method_name}' blocked from execution, supervisor needs to be updated first"
             )
+        if (
+            JobCondition.ARCHITECTURE_SUPPORTED in used_conditions
+            and UnsupportedReason.SYSTEM_ARCHITECTURE
+            in coresys.sys_resolution.unsupported
+        ):
+            raise JobConditionException(
+                f"'{method_name}' blocked from execution, unsupported system architecture"
+            )
 
         if JobCondition.PLUGINS_UPDATED in used_conditions and (
             out_of_date := [
@@ -449,12 +460,19 @@ class Job(CoreSysAttributes):
                 if plugin.need_update
             ]
         ):
+            if not coresys.sys_updater.auto_update:
+                raise JobConditionException(
+                    f"'{method_name}' blocked from execution, plugin(s) {', '.join(plugin.slug for plugin in out_of_date)} are not up to date and auto-update is disabled"
+                )
+
             errors = await asyncio.gather(
                 *[plugin.update() for plugin in out_of_date], return_exceptions=True
             )
 
             if update_failures := [
-                out_of_date[i].slug for i in range(len(errors)) if errors[i] is not None
+                plugin.slug
+                for plugin, error in zip(out_of_date, errors)
+                if error is not None
             ]:
                 raise JobConditionException(
                     f"'{method_name}' blocked from execution, was unable to update plugin(s) {', '.join(update_failures)} and all plugins must be up to date first"
