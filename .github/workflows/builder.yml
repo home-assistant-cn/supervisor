@@ -350,43 +350,11 @@ jobs:
       - &wait_for_supervisor
         name: Wait for Supervisor to come up
         run: |
-          # Wait for Supervisor to create hassio network and get its IP.
-          # Check container status — if it crashed, show logs and fail fast
-          # instead of looping until the 60-minute job timeout.
-          network_timeout=120
-          network_elapsed=0
-          SUPERVISOR=""
-
-          while [ $network_elapsed -lt $network_timeout ]; do
-            container_status=$(docker inspect --format='{{.State.Status}}' hassio_supervisor 2>/dev/null)
-            if [ "$container_status" != "running" ]; then
-              echo "ERROR: Supervisor container is not running (status: ${container_status:-not found})"
-              echo "=== Supervisor logs (last 100 lines) ==="
-              docker logs --tail 100 hassio_supervisor 2>&1 || echo "No logs available"
-              exit 1
-            fi
-
-            SUPERVISOR=$(docker inspect --format='{{.NetworkSettings.Networks.hassio.IPAddress}}' hassio_supervisor 2>/dev/null)
-            if [ -n "$SUPERVISOR" ] && [ "$SUPERVISOR" != "<no value>" ]; then
-              break
-            fi
-
-            if [ $((network_elapsed % 15)) -eq 0 ]; then
-              echo "Waiting for network configuration... (${network_elapsed}s/${network_timeout}s)"
-            fi
-
-            sleep 5
-            network_elapsed=$((network_elapsed + 5))
+          until SUPERVISOR=$(docker inspect --format='{{.NetworkSettings.Networks.hassio.IPAddress}}' hassio_supervisor 2>/dev/null) && \
+                [ -n "$SUPERVISOR" ] && [ "$SUPERVISOR" != "<no value>" ]; do
+            echo "Waiting for network configuration..."
+            sleep 1
           done
-
-          if [ -z "$SUPERVISOR" ] || [ "$SUPERVISOR" = "<no value>" ]; then
-            echo "ERROR: Supervisor did not connect to hassio network within ${network_timeout}s"
-            echo "=== Supervisor logs (last 100 lines) ==="
-            docker logs --tail 100 hassio_supervisor 2>&1 || echo "No logs available"
-            exit 1
-          fi
-
-          echo "Supervisor IP: ${SUPERVISOR}"
           echo "Waiting for Supervisor API at http://${SUPERVISOR}/supervisor/ping"
           timeout=300
           elapsed=0
@@ -409,8 +377,8 @@ jobs:
 
           echo "ERROR: Supervisor failed to start within ${timeout}s"
           echo "Last response: $response"
-          echo "=== Supervisor logs (last 100 lines) ==="
-          docker logs --tail 100 hassio_supervisor 2>&1 || echo "No logs available"
+          echo "Checking supervisor logs..."
+          docker logs --tail 50 hassio_supervisor
           exit 1
 
       # Wait for Core to come up so subsequent steps (backup, addon install) succeed.
