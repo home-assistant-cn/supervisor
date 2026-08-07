@@ -213,7 +213,7 @@ class APIAddons(CoreSysAttributes):
         """Return add-on information."""
         addon: Addon = self.get_addon_for_request(request)
 
-        data = {
+        return {
             ATTR_NAME: addon.name,
             ATTR_SLUG: addon.slug,
             ATTR_HOSTNAME: addon.hostname,
@@ -289,8 +289,6 @@ class APIAddons(CoreSysAttributes):
             ATTR_SYSTEM_MANAGED: addon.system_managed,
             ATTR_SYSTEM_MANAGED_CONFIG_ENTRY: addon.system_managed_config_entry,
         }
-
-        return data
 
     @api_process
     async def options(self, request: web.Request) -> None:

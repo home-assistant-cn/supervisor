@@ -96,7 +96,7 @@ from ..exceptions import (
     AppNotSupportedHomeAssistantVersionError,
     AppNotSupportedMachineTypeError,
 )
-from ..jobs.const import JOB_GROUP_ADDON
+from ..jobs.const import JOB_GROUP_APP
 from ..jobs.job_group import JobGroup
 from ..utils import version_is_new_enough
 from .configuration import FolderMapping
@@ -122,7 +122,7 @@ class AddonModel(JobGroup, ABC):
     def __init__(self, coresys: CoreSys, slug: str):
         """Initialize data holder."""
         super().__init__(
-            coresys, JOB_GROUP_ADDON.format_map(defaultdict(str, slug=slug)), slug
+            coresys, JOB_GROUP_APP.format_map(defaultdict(str, slug=slug)), slug
         )
         self.slug: str = slug
         self._path_icon_exists: bool = False
@@ -686,7 +686,7 @@ class AddonModel(JobGroup, ABC):
         # Architecture
         if not self.sys_arch.is_supported(config[ATTR_ARCH]):
             raise AppNotSupportedArchitectureError(
-                logger, slug=self.slug, architectures=config[ATTR_ARCH]
+                logger, app=self.slug, architectures=config[ATTR_ARCH]
             )
 
         # Machine / Hardware
@@ -695,7 +695,7 @@ class AddonModel(JobGroup, ABC):
             f"!{self.sys_machine}" in machine or self.sys_machine not in machine
         ):
             raise AppNotSupportedMachineTypeError(
-                logger, slug=self.slug, machine_types=machine
+                logger, app=self.slug, machine_types=machine
             )
 
         # Home Assistant
@@ -705,7 +705,7 @@ class AddonModel(JobGroup, ABC):
                 self.sys_homeassistant.version, version
             ):
                 raise AppNotSupportedHomeAssistantVersionError(
-                    logger, slug=self.slug, version=str(version)
+                    logger, app=self.slug, version=str(version)
                 )
 
     def _available(self, config) -> bool:

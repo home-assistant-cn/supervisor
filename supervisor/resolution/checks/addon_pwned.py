@@ -46,7 +46,7 @@ class CheckAddonPwned(CheckBase):
                 try:
                     await self.sys_security.verify_secret(secret)
                 except PwnedConnectivityError:
-                    self.sys_supervisor.connectivity = False
+                    self.sys_supervisor.request_connectivity_check()
                     return
                 except PwnedSecret:
                     # Check possible suggestion

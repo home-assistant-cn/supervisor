@@ -25,7 +25,7 @@ class AddonStore(AddonModel):
     @property
     def data(self) -> Data:
         """Return add-on data/config."""
-        return self._data or self.sys_store.data.addons[self.slug]
+        return self._data or self.sys_store.data.apps[self.slug]
 
     @property
     def is_installed(self) -> bool:

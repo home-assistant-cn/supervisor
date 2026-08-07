@@ -34,13 +34,13 @@ class FixupAddonExecuteStart(FixupBase):
             start_task = await addon.start()
         except AppsError as err:
             _LOGGER.error("Could not start %s due to %s", suggestion.reference, err)
-            raise ResolutionFixupError() from None
+            raise ResolutionFixupError from None
 
         # Wait for addon start. If it ends up in error or unknown state it's not fixed
         await start_task
         if addon.state in {AppState.ERROR, AppState.UNKNOWN}:
             _LOGGER.error("Addon %s could not start successfully", suggestion.reference)
-            raise ResolutionFixupError()
+            raise ResolutionFixupError
 
     @property
     def suggestion(self) -> SuggestionType:

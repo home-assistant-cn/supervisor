@@ -682,7 +682,7 @@ class DockerAddon(DockerInterface):
         build_env = await AddonBuild(self.coresys, self.addon).load_config()
         if not await build_env.is_valid():
             _LOGGER.error("Invalid build environment, can't build this add-on!")
-            raise DockerError()
+            raise DockerError
 
         _LOGGER.info("Starting build for %s:%s", self.image, version)
 
@@ -734,7 +734,7 @@ class DockerAddon(DockerInterface):
             aiodocker.DockerError,
         ) as err:
             _LOGGER.error("Can't build %s:%s: %s", self.image, version, err)
-            raise DockerError() from err
+            raise DockerError from err
 
         _LOGGER.info("Build %s:%s done", self.image, version)
 
@@ -795,7 +795,7 @@ class DockerAddon(DockerInterface):
     async def write_stdin(self, data: bytes) -> None:
         """Write to add-on stdin."""
         if not await self.is_running():
-            raise DockerError()
+            raise DockerError
 
         await self.sys_run_in_executor(self._write_stdin, data)
 
@@ -810,7 +810,7 @@ class DockerAddon(DockerInterface):
             socket = container.attach_socket(params={"stdin": 1, "stream": 1})
         except (docker.errors.DockerException, requests.RequestException) as err:
             _LOGGER.error("Can't attach to %s stdin: %s", self.name, err)
-            raise DockerError() from err
+            raise DockerError from err
 
         try:
             # Write to stdin
@@ -819,7 +819,7 @@ class DockerAddon(DockerInterface):
             socket.close()
         except OSError as err:
             _LOGGER.error("Can't write to %s stdin: %s", self.name, err)
-            raise DockerError() from err
+            raise DockerError from err
 
     @Job(
         name="docker_addon_stop",
