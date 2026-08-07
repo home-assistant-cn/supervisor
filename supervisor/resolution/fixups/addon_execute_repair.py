@@ -3,6 +3,7 @@
 import logging
 
 from ...coresys import CoreSys
+from ..data import Suggestion
 from ..const import ContextType, IssueType, SuggestionType
 from .base import FixupBase
 
@@ -23,26 +24,26 @@ class FixupAddonExecuteRepair(FixupBase):
         super().__init__(coresys)
         self.attempts = 0
 
-    async def process_fixup(self, reference: str | None = None) -> None:
+    async def process_fixup(self, suggestion: Suggestion) -> None:
         """Pull the addons image."""
-        if not reference:
+        if not suggestion.reference:
             return
 
-        addon = self.sys_addons.get_local_only(reference)
+        addon = self.sys_apps.get_local_only(suggestion.reference)
         if not addon:
             _LOGGER.info(
                 "Cannot repair addon %s as it is not installed, dismissing suggestion",
-                reference,
+                suggestion.reference,
             )
             return
 
         if await addon.instance.exists():
             _LOGGER.info(
-                "Addon %s does not need repair, dismissing suggestion", reference
+                "Addon %s does not need repair, dismissing suggestion", suggestion.reference
             )
             return
 
-        _LOGGER.info("Installing image for addon %s", reference)
+        _LOGGER.info("Installing image for addon %s", suggestion.reference)
         self.attempts += 1
         await addon.instance.install(addon.version)
 

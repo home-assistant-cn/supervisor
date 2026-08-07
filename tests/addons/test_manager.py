@@ -12,7 +12,7 @@ import pytest
 from supervisor.addons.addon import Addon
 from supervisor.arch import CpuArch
 from supervisor.config import CoreConfig
-from supervisor.const import AddonBoot, AddonStartup, AddonState, BusEvent
+from supervisor.const import AppBoot, AppStartup, AppState, BusEvent
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.const import ContainerState
@@ -20,8 +20,8 @@ from supervisor.docker.interface import DockerInterface
 from supervisor.docker.manager import DockerAPI
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
-    AddonConfigurationError,
-    AddonsError,
+    AppConfigurationError,
+    AppsError,
     DockerAPIError,
     DockerNotFound,
 )
@@ -130,14 +130,14 @@ async def test_addon_boot_system_error(
     coresys: CoreSys, install_addon_ssh: Addon, capture_exception: Mock, err
 ):
     """Test system errors during addon boot."""
-    install_addon_ssh.boot = AddonBoot.AUTO
+    install_addon_ssh.boot = AppBoot.AUTO
     assert coresys.resolution.issues == []
     assert coresys.resolution.suggestions == []
     with (
         patch.object(Addon, "write_options"),
         patch.object(DockerAddon, "run", side_effect=err),
     ):
-        await coresys.addons.boot(AddonStartup.APPLICATION)
+        await coresys.addons.boot(AppStartup.APPLICATION)
 
     capture_exception.assert_not_called()
     assert coresys.resolution.issues == [BOOT_FAIL_ISSUE]
@@ -148,9 +148,9 @@ async def test_addon_boot_user_error(
     coresys: CoreSys, install_addon_ssh: Addon, capture_exception: Mock
 ):
     """Test user error during addon boot."""
-    install_addon_ssh.boot = AddonBoot.AUTO
-    with patch.object(Addon, "write_options", side_effect=AddonConfigurationError):
-        await coresys.addons.boot(AddonStartup.APPLICATION)
+    install_addon_ssh.boot = AppBoot.AUTO
+    with patch.object(Addon, "write_options", side_effect=AppConfigurationError):
+        await coresys.addons.boot(AppStartup.APPLICATION)
 
     capture_exception.assert_not_called()
     assert coresys.resolution.issues == [BOOT_FAIL_ISSUE]
@@ -161,13 +161,13 @@ async def test_addon_boot_other_error(
     coresys: CoreSys, install_addon_ssh: Addon, capture_exception: Mock
 ):
     """Test other errors captured during addon boot."""
-    install_addon_ssh.boot = AddonBoot.AUTO
+    install_addon_ssh.boot = AppBoot.AUTO
     err = OSError()
     with (
         patch.object(Addon, "write_options"),
         patch.object(DockerAddon, "run", side_effect=err),
     ):
-        await coresys.addons.boot(AddonStartup.APPLICATION)
+        await coresys.addons.boot(AppStartup.APPLICATION)
 
     capture_exception.assert_called_once_with(err)
     assert coresys.resolution.issues == [BOOT_FAIL_ISSUE]
@@ -178,14 +178,14 @@ async def test_addon_shutdown_error(
     coresys: CoreSys, install_addon_ssh: Addon, capture_exception: Mock
 ):
     """Test errors captured during addon shutdown."""
-    install_addon_ssh.state = AddonState.STARTED
+    install_addon_ssh.state = AppState.STARTED
     with patch.object(DockerAddon, "stop", side_effect=DockerNotFound()):
-        await coresys.addons.shutdown(AddonStartup.APPLICATION)
+        await coresys.addons.shutdown(AppStartup.APPLICATION)
 
-    assert install_addon_ssh.state == AddonState.ERROR
+    assert install_addon_ssh.state == AppState.ERROR
     capture_exception.assert_called_once()
     assert check_exception_chain(
-        capture_exception.call_args[0][0], (AddonsError, DockerNotFound)
+        capture_exception.call_args[0][0], (AppsError, DockerNotFound)
     )
 
 
@@ -250,9 +250,9 @@ async def test_boot_waits_for_addons(
     install_addon_ssh.path_data.mkdir()
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
-    addon_state: AddonState | None = None
+    addon_state: AppState | None = None
 
     async def fire_container_event(*args, **kwargs):
         nonlocal addon_state
@@ -269,10 +269,10 @@ async def test_boot_waits_for_addons(
         )
 
     with patch.object(DockerAddon, "run", new=fire_container_event):
-        await coresys.addons.boot(AddonStartup.APPLICATION)
+        await coresys.addons.boot(AppStartup.APPLICATION)
 
-    assert addon_state == AddonState.STOPPED
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert addon_state == AppState.STOPPED
+    assert install_addon_ssh.state == AppState.STARTED
 
 
 @pytest.mark.parametrize("status", ["running", "stopped"])
@@ -342,7 +342,7 @@ async def test_start_wait_cancel_on_uninstall(
     container.attrs["Config"] = {"Healthcheck": "exists"}
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
     start_task = await install_addon_ssh.start()
     assert start_task
@@ -359,7 +359,7 @@ async def test_start_wait_cancel_on_uninstall(
     await asyncio.sleep(0.01)
 
     assert not start_task.done()
-    assert install_addon_ssh.state == AddonState.STARTUP
+    assert install_addon_ssh.state == AppState.STARTUP
 
     caplog.clear()
     await coresys.addons.uninstall(TEST_ADDON_SLUG)

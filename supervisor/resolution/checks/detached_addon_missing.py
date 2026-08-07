@@ -1,6 +1,7 @@
 """Helpers to check for detached addons due to repo misisng."""
 
 from ...const import CoreState
+from ..data import Issue
 from ...coresys import CoreSys
 from ..const import ContextType, IssueType
 from .base import CheckBase
@@ -16,7 +17,7 @@ class CheckDetachedAddonMissing(CheckBase):
 
     async def run_check(self) -> None:
         """Run check if not affected by issue."""
-        for addon in self.sys_addons.installed:
+        for addon in self.sys_apps.installed:
             if (
                 addon.is_detached
                 and addon.repository not in self.sys_store.repositories
@@ -27,12 +28,12 @@ class CheckDetachedAddonMissing(CheckBase):
                     reference=addon.slug,
                 )
 
-    async def approve_check(self, reference: str | None = None) -> bool:
+    async def approve_check(self, issue: Issue) -> bool:
         """Approve check if it is affected by issue."""
-        if not reference:
+        if not issue.reference:
             return False
 
-        addon = self.sys_addons.get_local_only(reference)
+        addon = self.sys_apps.get_local_only(issue.reference)
         return addon is not None and addon.is_detached
 
     @property

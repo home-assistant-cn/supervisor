@@ -3,6 +3,7 @@
 import logging
 
 from ...coresys import CoreSys
+from ..data import Suggestion
 from ...docker.const import ContainerState
 from ..const import ContextType, IssueType, SuggestionType
 from .base import FixupBase
@@ -18,16 +19,16 @@ def setup(coresys: CoreSys) -> FixupBase:
 class FixupAddonExecuteRebuild(FixupBase):
     """Storage class for fixup."""
 
-    async def process_fixup(self, reference: str | None = None) -> None:
+    async def process_fixup(self, suggestion: Suggestion) -> None:
         """Rebuild the addon's container."""
-        if not reference:
+        if not suggestion.reference:
             return
 
-        addon = self.sys_addons.get_local_only(reference)
+        addon = self.sys_apps.get_local_only(suggestion.reference)
         if not addon:
             _LOGGER.info(
                 "Cannot rebuild addon %s as it is not installed, dismissing suggestion",
-                reference,
+                suggestion.reference,
             )
             return
 
@@ -35,12 +36,12 @@ class FixupAddonExecuteRebuild(FixupBase):
         if state == ContainerState.UNKNOWN:
             _LOGGER.info(
                 "Container for addon %s does not exist, it will be rebuilt when started next",
-                reference,
+                suggestion.reference,
             )
         elif state == ContainerState.STOPPED:
             _LOGGER.info(
                 "Addon %s is stopped, removing its container so it rebuilds when started next",
-                reference,
+                suggestion.reference,
             )
             await addon.stop()
         else:

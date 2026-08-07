@@ -3,7 +3,8 @@
 import logging
 
 from ...coresys import CoreSys
-from ...exceptions import AddonsError, ResolutionFixupError
+from ..data import Suggestion
+from ...exceptions import AppsError, ResolutionFixupError
 from ..const import ContextType, IssueType, SuggestionType
 from .base import FixupBase
 
@@ -18,20 +19,20 @@ def setup(coresys: CoreSys) -> FixupBase:
 class FixupAddonExecuteRestart(FixupBase):
     """Storage class for fixup."""
 
-    async def process_fixup(self, reference: str | None = None) -> None:
+    async def process_fixup(self, suggestion: Suggestion) -> None:
         """Initialize the fixup class."""
-        if not reference:
+        if not suggestion.reference:
             return
 
-        if not (addon := self.sys_addons.get_local_only(reference)):
-            _LOGGER.info("Cannot restart addon %s as it does not exist", reference)
+        if not (addon := self.sys_apps.get_local_only(suggestion.reference)):
+            _LOGGER.info("Cannot restart addon %s as it does not exist", suggestion.reference)
             return
 
         # Stop addon
         try:
             await addon.stop()
-        except AddonsError as err:
-            _LOGGER.error("Could not stop %s due to %s", reference, err)
+        except AppsError as err:
+            _LOGGER.error("Could not stop %s due to %s", suggestion.reference, err)
             raise ResolutionFixupError() from None
 
         # Start addon
@@ -39,8 +40,8 @@ class FixupAddonExecuteRestart(FixupBase):
         # So any errors on startup are just logged. We won't wait on the startup task either
         try:
             await addon.start()
-        except AddonsError as err:
-            _LOGGER.error("Could not restart %s due to %s", reference, err)
+        except AppsError as err:
+            _LOGGER.error("Could not restart %s due to %s", suggestion.reference, err)
 
     @property
     def suggestion(self) -> SuggestionType:

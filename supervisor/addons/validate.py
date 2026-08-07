@@ -99,11 +99,11 @@ from ..const import (
     ATTR_WEBUI,
     ROLE_ALL,
     ROLE_DEFAULT,
-    AddonBoot,
-    AddonBootConfig,
-    AddonStage,
-    AddonStartup,
-    AddonState,
+    AppBoot,
+    AppBootConfig,
+    AppStage,
+    AppStartup,
+    AppState,
 )
 from ..docker.const import Capabilities
 from ..validate import (
@@ -234,9 +234,9 @@ def _migrate_addon_config(protocol=False):
                     name,
                 )
             if value == "before":
-                config[ATTR_STARTUP] = AddonStartup.SERVICES
+                config[ATTR_STARTUP] = AppStartup.SERVICES
             elif value == "after":
-                config[ATTR_STARTUP] = AddonStartup.APPLICATION
+                config[ATTR_STARTUP] = AppStartup.APPLICATION
 
         # UART 2021-01-20
         if "auto_uart" in config:
@@ -352,15 +352,15 @@ _SCHEMA_ADDON_CONFIG = vol.Schema(
         vol.Required(ATTR_ARCH): [vol.In(ARCH_ALL)],
         vol.Optional(ATTR_MACHINE): vol.All([vol.Match(RE_MACHINE)], vol.Unique()),
         vol.Optional(ATTR_URL): vol.Url(),
-        vol.Optional(ATTR_STARTUP, default=AddonStartup.APPLICATION): vol.Coerce(
-            AddonStartup
+        vol.Optional(ATTR_STARTUP, default=AppStartup.APPLICATION): vol.Coerce(
+            AppStartup
         ),
-        vol.Optional(ATTR_BOOT, default=AddonBootConfig.AUTO): vol.Coerce(
-            AddonBootConfig
+        vol.Optional(ATTR_BOOT, default=AppBootConfig.AUTO): vol.Coerce(
+            AppBootConfig
         ),
         vol.Optional(ATTR_INIT, default=True): vol.Boolean(),
         vol.Optional(ATTR_ADVANCED, default=False): vol.Boolean(),
-        vol.Optional(ATTR_STAGE, default=AddonStage.STABLE): vol.Coerce(AddonStage),
+        vol.Optional(ATTR_STAGE, default=AppStage.STABLE): vol.Coerce(AppStage),
         vol.Optional(ATTR_PORTS): docker_ports,
         vol.Optional(ATTR_PORTS_DESCRIPTION): docker_ports_description,
         vol.Optional(ATTR_WATCHDOG): vol.Match(
@@ -500,7 +500,7 @@ SCHEMA_ADDON_USER = vol.Schema(
         vol.Optional(ATTR_INGRESS_TOKEN, default=secrets.token_urlsafe): str,
         vol.Optional(ATTR_OPTIONS, default=dict): dict,
         vol.Optional(ATTR_AUTO_UPDATE, default=False): vol.Boolean(),
-        vol.Optional(ATTR_BOOT): vol.Coerce(AddonBoot),
+        vol.Optional(ATTR_BOOT): vol.Coerce(AppBoot),
         vol.Optional(ATTR_NETWORK): docker_ports,
         vol.Optional(ATTR_AUDIO_OUTPUT): vol.Maybe(str),
         vol.Optional(ATTR_AUDIO_INPUT): vol.Maybe(str),
@@ -540,7 +540,7 @@ SCHEMA_ADDON_BACKUP = vol.Schema(
     {
         vol.Required(ATTR_USER): SCHEMA_ADDON_USER,
         vol.Required(ATTR_SYSTEM): SCHEMA_ADDON_SYSTEM,
-        vol.Required(ATTR_STATE): vol.Coerce(AddonState),
+        vol.Required(ATTR_STATE): vol.Coerce(AppState),
         vol.Required(ATTR_VERSION): version_tag,
     },
     extra=vol.REMOVE_EXTRA,

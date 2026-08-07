@@ -780,7 +780,7 @@ class DockerAddon(DockerInterface):
             {old_image} if old_image else None,
             keep_images={
                 f"{addon.image}:{addon.version}"
-                for addon in self.sys_addons.installed
+                for addon in self.sys_apps.installed
                 if addon.slug != self.addon.slug
                 and addon.image
                 and addon.image in {old_image, use_image}

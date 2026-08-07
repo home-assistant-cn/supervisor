@@ -30,7 +30,7 @@ class AddonStore(AddonModel):
     @property
     def is_installed(self) -> bool:
         """Return True if an add-on is installed."""
-        return self.sys_addons.get_local_only(self.slug) is not None
+        return self.sys_apps.get_local_only(self.slug) is not None
 
     @property
     def is_detached(self) -> bool:

@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from supervisor.addons.addon import Addon
-from supervisor.const import AddonState
+from supervisor.const import AppState
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.exceptions import DockerError
@@ -21,12 +21,12 @@ EXECUTE_START_SUGGESTION = Suggestion(
 
 
 @pytest.mark.parametrize(
-    "state", [AddonState.STARTED, AddonState.STARTUP, AddonState.STOPPED]
+    "state", [AppState.STARTED, AppState.STARTUP, AppState.STOPPED]
 )
 @pytest.mark.usefixtures("path_extern")
-async def test_fixup(coresys: CoreSys, install_addon_ssh: Addon, state: AddonState):
+async def test_fixup(coresys: CoreSys, install_addon_ssh: Addon, state: AppState):
     """Test fixup starts addon."""
-    install_addon_ssh.state = AddonState.UNKNOWN
+    install_addon_ssh.state = AppState.UNKNOWN
     addon_execute_start = FixupAddonExecuteStart(coresys)
     assert addon_execute_start.auto is False
 
@@ -52,7 +52,7 @@ async def test_fixup(coresys: CoreSys, install_addon_ssh: Addon, state: AddonSta
 @pytest.mark.usefixtures("path_extern")
 async def test_fixup_start_error(coresys: CoreSys, install_addon_ssh: Addon):
     """Test fixup fails on start addon failure."""
-    install_addon_ssh.state = AddonState.UNKNOWN
+    install_addon_ssh.state = AppState.UNKNOWN
     addon_execute_start = FixupAddonExecuteStart(coresys)
 
     coresys.resolution.add_issue(
@@ -70,13 +70,13 @@ async def test_fixup_start_error(coresys: CoreSys, install_addon_ssh: Addon):
     assert EXECUTE_START_SUGGESTION in coresys.resolution.suggestions
 
 
-@pytest.mark.parametrize("state", [AddonState.ERROR, AddonState.UNKNOWN])
+@pytest.mark.parametrize("state", [AppState.ERROR, AppState.UNKNOWN])
 @pytest.mark.usefixtures("path_extern")
 async def test_fixup_wait_start_failure(
-    coresys: CoreSys, install_addon_ssh: Addon, state: AddonState
+    coresys: CoreSys, install_addon_ssh: Addon, state: AppState
 ):
     """Test fixup fails if addon does not complete startup."""
-    install_addon_ssh.state = AddonState.UNKNOWN
+    install_addon_ssh.state = AppState.UNKNOWN
     addon_execute_start = FixupAddonExecuteStart(coresys)
 
     async def mock_start(*args, **kwargs):

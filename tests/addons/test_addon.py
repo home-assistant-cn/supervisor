@@ -17,13 +17,13 @@ from supervisor.addons.addon import Addon
 from supervisor.addons.const import AddonBackupMode
 from supervisor.addons.model import AddonModel
 from supervisor.config import CoreConfig
-from supervisor.const import AddonBoot, AddonState, BusEvent
+from supervisor.const import AppBoot, AppState, BusEvent
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.const import ContainerState
 from supervisor.docker.manager import CommandReturn, DockerAPI
 from supervisor.docker.monitor import DockerContainerStateEvent
-from supervisor.exceptions import AddonsError, AddonsJobError, AudioUpdateError
+from supervisor.exceptions import AppsError, AppsJobError, AudioUpdateError
 from supervisor.hardware.helper import HwHelper
 from supervisor.ingress import Ingress
 from supervisor.store.repository import Repository
@@ -106,29 +106,29 @@ async def test_addon_state_listener(coresys: CoreSys, install_addon_ssh: Addon) 
     with patch.object(DockerAddon, "attach"):
         await install_addon_ssh.load()
 
-    assert install_addon_ssh.state == AddonState.UNKNOWN
+    assert install_addon_ssh.state == AppState.UNKNOWN
 
     with patch.object(Addon, "watchdog_container"):
         _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
         await asyncio.sleep(0)
-        assert install_addon_ssh.state == AddonState.STARTED
+        assert install_addon_ssh.state == AppState.STARTED
 
         _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.STOPPED)
         await asyncio.sleep(0)
-        assert install_addon_ssh.state == AddonState.STOPPED
+        assert install_addon_ssh.state == AppState.STOPPED
 
         _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
         await asyncio.sleep(0)
-        assert install_addon_ssh.state == AddonState.STARTED
+        assert install_addon_ssh.state == AppState.STARTED
 
         _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.FAILED)
         await asyncio.sleep(0)
-        assert install_addon_ssh.state == AddonState.ERROR
+        assert install_addon_ssh.state == AppState.ERROR
 
         # Test other addons are ignored
         _fire_test_event(coresys, "addon_local_non_installed", ContainerState.RUNNING)
         await asyncio.sleep(0)
-        assert install_addon_ssh.state == AddonState.ERROR
+        assert install_addon_ssh.state == AppState.ERROR
 
 
 async def test_addon_watchdog(coresys: CoreSys, install_addon_ssh: Addon) -> None:
@@ -240,7 +240,7 @@ async def test_listener_attached_on_install(
 
     _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
     await asyncio.sleep(0)
-    assert coresys.addons.get(TEST_ADDON_SLUG).state == AddonState.STARTED
+    assert coresys.addons.get(TEST_ADDON_SLUG).state == AppState.STARTED
 
 
 @pytest.mark.parametrize(
@@ -289,9 +289,9 @@ async def test_install_update_fails_if_out_of_date(
     with patch.object(
         type(coresys.supervisor), "need_update", new=PropertyMock(return_value=True)
     ):
-        with pytest.raises(AddonsJobError):
+        with pytest.raises(AppsJobError):
             await coresys.addons.install(TEST_ADDON_SLUG)
-        with pytest.raises(AddonsJobError):
+        with pytest.raises(AppsJobError):
             await coresys.addons.update(TEST_ADDON_SLUG)
 
     with (
@@ -304,9 +304,9 @@ async def test_install_update_fails_if_out_of_date(
             type(coresys.plugins.audio), "update", side_effect=AudioUpdateError
         ),
     ):
-        with pytest.raises(AddonsJobError):
+        with pytest.raises(AppsJobError):
             await coresys.addons.install(TEST_ADDON_SLUG)
-        with pytest.raises(AddonsJobError):
+        with pytest.raises(AppsJobError):
             await coresys.addons.update(TEST_ADDON_SLUG)
 
 
@@ -346,14 +346,14 @@ async def test_start(
     install_addon_ssh.path_data.mkdir()
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
     start_task = await install_addon_ssh.start()
     assert start_task
 
     _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
     await start_task
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert install_addon_ssh.state == AppState.STARTED
 
 
 @pytest.mark.parametrize("state", [ContainerState.HEALTHY, ContainerState.UNHEALTHY])
@@ -370,7 +370,7 @@ async def test_start_wait_healthcheck(
     container.attrs["Config"] = {"Healthcheck": "exists"}
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
     start_task = await install_addon_ssh.start()
     assert start_task
@@ -379,13 +379,13 @@ async def test_start_wait_healthcheck(
     await asyncio.sleep(0.01)
 
     assert not start_task.done()
-    assert install_addon_ssh.state == AddonState.STARTUP
+    assert install_addon_ssh.state == AppState.STARTUP
 
     _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", state)
     await asyncio.sleep(0.01)
 
     assert start_task.done()
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert install_addon_ssh.state == AppState.STARTED
 
 
 async def test_start_timeout(
@@ -400,7 +400,7 @@ async def test_start_timeout(
     install_addon_ssh.path_data.mkdir()
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
     start_task = await install_addon_ssh.start()
     assert start_task
@@ -425,14 +425,14 @@ async def test_restart(
     install_addon_ssh.path_data.mkdir()
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
     start_task = await install_addon_ssh.restart()
     assert start_task
 
     _fire_test_event(coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
     await start_task
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert install_addon_ssh.state == AppState.STARTED
 
 
 @pytest.mark.parametrize("status", ["running", "stopped"])
@@ -535,7 +535,7 @@ async def test_backup_with_pre_command_error(
     with (
         patch.object(DockerAddon, "is_running", return_value=True),
         patch.object(Addon, "backup_pre", new=PropertyMock(return_value="backup_pre")),
-        pytest.raises(AddonsError),
+        pytest.raises(AppsError),
     ):
         assert await install_addon_ssh.backup(tarfile) is None
 
@@ -702,7 +702,7 @@ async def test_start_when_running(
     container.status = "running"
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert install_addon_ssh.state == AppState.STARTED
 
     caplog.clear()
     start_task = await install_addon_ssh.start()
@@ -743,7 +743,7 @@ async def test_local_example_start(
     install_addon_example.path_data.mkdir()
     await install_addon_example.load()
     await asyncio.sleep(0)
-    assert install_addon_example.state == AddonState.STOPPED
+    assert install_addon_example.state == AppState.STOPPED
 
     assert not (
         addon_config_dir := tmp_supervisor_data / "addon_configs" / "local_example"
@@ -991,12 +991,12 @@ async def test_addon_start_dismisses_boot_fail(
     coresys: CoreSys, install_addon_ssh: Addon
 ):
     """Test a successful start dismisses the boot fail issue."""
-    install_addon_ssh.state = AddonState.ERROR
+    install_addon_ssh.state = AppState.ERROR
     coresys.resolution.add_issue(
         BOOT_FAIL_ISSUE, [suggestion.type for suggestion in BOOT_FAIL_SUGGESTIONS]
     )
 
-    install_addon_ssh.state = AddonState.STARTED
+    install_addon_ssh.state = AppState.STARTED
     assert coresys.resolution.issues == []
     assert coresys.resolution.suggestions == []
 
@@ -1005,12 +1005,12 @@ async def test_addon_disable_boot_dismisses_boot_fail(
     coresys: CoreSys, install_addon_ssh: Addon
 ):
     """Test a disabling boot dismisses the boot fail issue."""
-    install_addon_ssh.boot = AddonBoot.AUTO
-    install_addon_ssh.state = AddonState.ERROR
+    install_addon_ssh.boot = AppBoot.AUTO
+    install_addon_ssh.state = AppState.ERROR
     coresys.resolution.add_issue(
         BOOT_FAIL_ISSUE, [suggestion.type for suggestion in BOOT_FAIL_SUGGESTIONS]
     )
 
-    install_addon_ssh.boot = AddonBoot.MANUAL
+    install_addon_ssh.boot = AppBoot.MANUAL
     assert coresys.resolution.issues == []
     assert coresys.resolution.suggestions == []

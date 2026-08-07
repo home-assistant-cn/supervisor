@@ -54,10 +54,10 @@ from ..const import (
     ATTR_VERSION_TIMESTAMP,
     ATTR_WATCHDOG,
     DNS_SUFFIX,
-    AddonBoot,
-    AddonBootConfig,
-    AddonStartup,
-    AddonState,
+    AppBoot,
+    AppBootConfig,
+    AppStartup,
+    AppState,
     BusEvent,
 )
 from ..coresys import CoreSys
@@ -66,10 +66,10 @@ from ..docker.const import ContainerState
 from ..docker.monitor import DockerContainerStateEvent
 from ..docker.stats import DockerStats
 from ..exceptions import (
-    AddonConfigurationError,
-    AddonNotSupportedError,
-    AddonsError,
-    AddonsJobError,
+    AppConfigurationError,
+    AppNotSupportedError,
+    AppsError,
+    AppsJobError,
     ConfigurationFileError,
     DockerError,
     HostAppArmorError,
@@ -122,9 +122,9 @@ _OPTIONS_MERGER: Final = Merger(
 # Backups just need to know if an addon was running or not
 # Map other addon states to those two
 _MAP_ADDON_STATE = {
-    AddonState.STARTUP: AddonState.STARTED,
-    AddonState.ERROR: AddonState.STOPPED,
-    AddonState.UNKNOWN: AddonState.STOPPED,
+    AppState.STARTUP: AppState.STARTED,
+    AppState.ERROR: AppState.STOPPED,
+    AppState.UNKNOWN: AppState.STOPPED,
 }
 
 
@@ -135,7 +135,7 @@ class Addon(AddonModel):
         """Initialize data holder."""
         super().__init__(coresys, slug)
         self.instance: DockerAddon = DockerAddon(coresys, self)
-        self._state: AddonState = AddonState.UNKNOWN
+        self._state: AppState = AppState.UNKNOWN
         self._manual_stop: bool = False
         self._listeners: list[EventListener] = []
         self._startup_event = asyncio.Event()
@@ -162,12 +162,12 @@ class Addon(AddonModel):
         return self._device_access_missing_issue
 
     @property
-    def state(self) -> AddonState:
+    def state(self) -> AppState:
         """Return state of the add-on."""
         return self._state
 
     @state.setter
-    def state(self, new_state: AddonState) -> None:
+    def state(self, new_state: AppState) -> None:
         """Set the add-on into new state."""
         if self._state == new_state:
             return
@@ -175,19 +175,19 @@ class Addon(AddonModel):
         self._state = new_state
 
         # Signal listeners about addon state change
-        if new_state == AddonState.STARTED or old_state == AddonState.STARTUP:
+        if new_state == AppState.STARTED or old_state == AppState.STARTUP:
             self._startup_event.set()
 
         # Dismiss boot failed issue if present and we started
         if (
-            new_state == AddonState.STARTED
+            new_state == AppState.STARTED
             and self.boot_failed_issue in self.sys_resolution.issues
         ):
             self.sys_resolution.dismiss_issue(self.boot_failed_issue)
 
         # Dismiss device access missing issue if present and we stopped
         if (
-            new_state == AddonState.STOPPED
+            new_state == AppState.STOPPED
             and self.device_access_missing_issue in self.sys_resolution.issues
         ):
             self.sys_resolution.dismiss_issue(self.device_access_missing_issue)
@@ -249,7 +249,7 @@ class Addon(AddonModel):
     @property
     def data(self) -> Data:
         """Return add-on data/config."""
-        return self.sys_addons.data.system[self.slug]
+        return self.sys_apps.data.system[self.slug]
 
     @property
     def data_store(self) -> Data:
@@ -259,12 +259,12 @@ class Addon(AddonModel):
     @property
     def addon_store(self) -> AddonStore | None:
         """Return store representation of addon."""
-        return self.sys_addons.store.get(self.slug)
+        return self.sys_apps.store.get(self.slug)
 
     @property
     def persist(self) -> Data:
         """Return add-on data/config."""
-        return self.sys_addons.data.user[self.slug]
+        return self.sys_apps.data.user[self.slug]
 
     @property
     def is_installed(self) -> bool:
@@ -339,20 +339,20 @@ class Addon(AddonModel):
         self.persist[ATTR_OPTIONS] = {} if value is None else deepcopy(value)
 
     @property
-    def boot(self) -> AddonBoot:
+    def boot(self) -> AppBoot:
         """Return boot config with prio local settings unless config is forced."""
-        if self.boot_config == AddonBootConfig.MANUAL_ONLY:
+        if self.boot_config == AppBootConfig.MANUAL_ONLY:
             return super().boot
         return self.persist.get(ATTR_BOOT, super().boot)
 
     @boot.setter
-    def boot(self, value: AddonBoot) -> None:
+    def boot(self, value: AppBoot) -> None:
         """Store user boot options."""
         self.persist[ATTR_BOOT] = value
 
         # Dismiss boot failed issue if present and boot at start disabled
         if (
-            value == AddonBoot.MANUAL
+            value == AppBoot.MANUAL
             and self._boot_failed_issue in self.sys_resolution.issues
         ):
             self.sys_resolution.dismiss_issue(self._boot_failed_issue)
@@ -397,7 +397,7 @@ class Addon(AddonModel):
     @watchdog.setter
     def watchdog(self, value: bool) -> None:
         """Set watchdog enable/disable."""
-        if value and self.startup == AddonStartup.ONCE:
+        if value and self.startup == AppStartup.ONCE:
             _LOGGER.warning(
                 "Ignoring watchdog for %s because startup type is 'once'", self.slug
             )
@@ -664,7 +664,7 @@ class Addon(AddonModel):
 
     async def save_persist(self) -> None:
         """Save data of add-on."""
-        await self.sys_addons.data.save_data()
+        await self.sys_apps.data.save_data()
 
     async def watchdog_application(self) -> bool:
         """Return True if application is running."""
@@ -729,11 +729,11 @@ class Addon(AddonModel):
             _LOGGER.debug("Add-on %s write options: %s", self.slug, options)
             return
 
-        raise AddonConfigurationError()
+        raise AppConfigurationError
 
     @Job(
         name="addon_unload",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def unload(self) -> None:
@@ -766,15 +766,15 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_install",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def install(self) -> None:
         """Install and setup this addon."""
         if not self.addon_store:
-            raise AddonsError("Missing from store, cannot install!")
+            raise AppsError("Missing from store, cannot install!")
 
-        await self.sys_addons.data.install(self.addon_store)
+        await self.sys_apps.data.install(self.addon_store)
 
         def setup_data():
             if not self.path_data.is_dir():
@@ -794,14 +794,14 @@ class Addon(AddonModel):
                 self.latest_version, self.addon_store.image, arch=self.arch
             )
         except DockerError as err:
-            await self.sys_addons.data.uninstall(self)
-            raise AddonsError() from err
+            await self.sys_apps.data.uninstall(self)
+            raise AppsError from err
 
         # Finish initialization and set up listeners
         await self.load()
 
         # Add to addon manager
-        self.sys_addons.local[self.slug] = self
+        self.sys_apps.local[self.slug] = self
 
         # Reload ingress tokens
         if self.with_ingress:
@@ -809,7 +809,7 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_uninstall",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def uninstall(
@@ -819,9 +819,9 @@ class Addon(AddonModel):
         try:
             await self.instance.remove(remove_image=remove_image)
         except DockerError as err:
-            raise AddonsError() from err
+            raise AppsError from err
 
-        self.state = AddonState.UNKNOWN
+        self.state = AppState.UNKNOWN
 
         await self.unload()
 
@@ -865,8 +865,8 @@ class Addon(AddonModel):
             await service.del_service_data(self)
 
         # Remove from addon manager
-        self.sys_addons.local.pop(self.slug)
-        await self.sys_addons.data.uninstall(self)
+        self.sys_apps.local.pop(self.slug)
+        await self.sys_apps.data.uninstall(self)
 
         # Cleanup Ingress tokens
         if need_ingress_token_cleanup:
@@ -874,7 +874,7 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_update",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def update(self) -> asyncio.Task | None:
@@ -884,7 +884,7 @@ class Addon(AddonModel):
         if it was running. Else nothing is returned.
         """
         if not self.addon_store:
-            raise AddonsError("Missing from store, cannot update!")
+            raise AppsError("Missing from store, cannot update!")
 
         old_image = self.image
         # Cache data to prevent races with other updates to global
@@ -893,15 +893,15 @@ class Addon(AddonModel):
         try:
             await self.instance.update(store.version, store.image, arch=self.arch)
         except DockerError as err:
-            raise AddonsError() from err
+            raise AppsError from err
 
         # Stop the addon if running
-        if (last_state := self.state) in {AddonState.STARTED, AddonState.STARTUP}:
+        if (last_state := self.state) in {AppState.STARTED, AppState.STARTUP}:
             await self.stop()
 
         try:
             _LOGGER.info("Add-on '%s' successfully updated", self.slug)
-            await self.sys_addons.data.update(store)
+            await self.sys_apps.data.update(store)
             await self._check_ingress_port()
 
             # Cleanup
@@ -917,14 +917,14 @@ class Addon(AddonModel):
             # restore state. Return Task for caller if no exception
             out = (
                 await self.start()
-                if last_state in {AddonState.STARTED, AddonState.STARTUP}
+                if last_state in {AppState.STARTED, AppState.STARTUP}
                 else None
             )
         return out
 
     @Job(
         name="addon_rebuild",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def rebuild(self) -> asyncio.Task | None:
@@ -933,17 +933,17 @@ class Addon(AddonModel):
         Returns a Task that completes when addon has state 'started' (see start)
         if it was running. Else nothing is returned.
         """
-        last_state: AddonState = self.state
+        last_state: AppState = self.state
         try:
             # remove docker container but not addon config
             try:
                 await self.instance.remove()
                 await self.instance.install(self.version)
             except DockerError as err:
-                raise AddonsError() from err
+                raise AppsError from err
 
             if self.addon_store:
-                await self.sys_addons.data.update(self.addon_store)
+                await self.sys_apps.data.update(self.addon_store)
 
             await self._check_ingress_port()
             _LOGGER.info("Add-on '%s' successfully rebuilt", self.slug)
@@ -952,7 +952,7 @@ class Addon(AddonModel):
             # restore state
             out = (
                 await self.start()
-                if last_state in [AddonState.STARTED, AddonState.STARTUP]
+                if last_state in [AppState.STARTED, AppState.STARTUP]
                 else None
             )
         return out
@@ -1069,7 +1069,7 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_start",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def start(self) -> asyncio.Task:
@@ -1111,14 +1111,14 @@ class Addon(AddonModel):
         try:
             await self.instance.run()
         except DockerError as err:
-            self.state = AddonState.ERROR
-            raise AddonsError() from err
+            self.state = AppState.ERROR
+            raise AppsError from err
 
         return self.sys_create_task(self._wait_for_startup())
 
     @Job(
         name="addon_stop",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def stop(self) -> None:
@@ -1127,12 +1127,12 @@ class Addon(AddonModel):
         try:
             await self.instance.stop()
         except DockerError as err:
-            self.state = AddonState.ERROR
-            raise AddonsError() from err
+            self.state = AppState.ERROR
+            raise AppsError from err
 
     @Job(
         name="addon_restart",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def restart(self) -> asyncio.Task:
@@ -1140,7 +1140,7 @@ class Addon(AddonModel):
 
         Returns a Task that completes when addon has state 'started' (see start).
         """
-        with suppress(AddonsError):
+        with suppress(AppsError):
             await self.stop()
         return await self.start()
 
@@ -1163,24 +1163,24 @@ class Addon(AddonModel):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise AddonsError() from err
+            raise AppsError from err
 
     @Job(
         name="addon_write_stdin",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def write_stdin(self, data) -> None:
         """Write data to add-on stdin."""
         if not self.with_stdin:
-            raise AddonNotSupportedError(
+            raise AppNotSupportedError(
                 f"Add-on {self.slug} does not support writing to stdin!", _LOGGER.error
             )
 
         try:
             return await self.instance.write_stdin(data)
         except DockerError as err:
-            raise AddonsError() from err
+            raise AppsError from err
 
     async def _backup_command(self, command: str) -> None:
         try:
@@ -1189,19 +1189,19 @@ class Addon(AddonModel):
                 _LOGGER.debug(
                     "Pre-/Post backup command failed with: %s", command_return.output
                 )
-                raise AddonsError(
+                raise AppsError(
                     f"Pre-/Post backup command returned error code: {command_return.exit_code}",
                     _LOGGER.error,
                 )
         except DockerError as err:
-            raise AddonsError(
+            raise AppsError(
                 f"Failed running pre-/post backup command {command}: {str(err)}",
                 _LOGGER.error,
             ) from err
 
     @Job(
         name="addon_begin_backup",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def begin_backup(self) -> bool:
@@ -1223,7 +1223,7 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_end_backup",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def end_backup(self) -> asyncio.Task | None:
@@ -1261,7 +1261,7 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_backup",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def backup(self, tar_file: tarfile.TarFile) -> asyncio.Task | None:
@@ -1286,13 +1286,13 @@ class Addon(AddonModel):
                     try:
                         self.instance.export_image(temp_path.joinpath("image.tar"))
                     except DockerError as err:
-                        raise AddonsError() from err
+                        raise AppsError from err
 
                 # Store local configs/state
                 try:
                     write_json_file(temp_path.joinpath("addon.json"), metadata)
                 except ConfigurationFileError as err:
-                    raise AddonsError(
+                    raise AppsError(
                         f"Can't save meta for {self.slug}", _LOGGER.error
                     ) from err
 
@@ -1304,7 +1304,7 @@ class Addon(AddonModel):
                             apparmor_profile, profile_backup_file
                         )
                     except HostAppArmorError as err:
-                        raise AddonsError(
+                        raise AppsError(
                             "Can't backup AppArmor profile", _LOGGER.error
                         ) from err
 
@@ -1360,7 +1360,7 @@ class Addon(AddonModel):
             )
             _LOGGER.info("Finish backup for addon %s", self.slug)
         except (tarfile.TarError, OSError, AddFileError) as err:
-            raise AddonsError(f"Can't write tarfile: {err}", _LOGGER.error) from err
+            raise AppsError(f"Can't write tarfile: {err}", _LOGGER.error) from err
         finally:
             if was_running:
                 wait_for_start = await self.end_backup()
@@ -1369,7 +1369,7 @@ class Addon(AddonModel):
 
     @Job(
         name="addon_restore",
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def restore(self, tar_file: tarfile.TarFile) -> asyncio.Task | None:
@@ -1402,25 +1402,25 @@ class Addon(AddonModel):
         try:
             tmp, data = await self.sys_run_in_executor(_extract_tarfile)
         except tarfile.TarError as err:
-            raise AddonsError(
+            raise AppsError(
                 f"Can't read tarfile {tar_file}: {err}", _LOGGER.error
             ) from err
         except ConfigurationFileError as err:
-            raise AddonsError() from err
+            raise AppsError from err
 
         try:
             # Validate
             try:
                 data = SCHEMA_ADDON_BACKUP(data)
             except vol.Invalid as err:
-                raise AddonsError(
+                raise AppsError(
                     f"Can't validate {self.slug}, backup data: {humanize_error(data, err)}",
                     _LOGGER.error,
                 ) from err
 
             # If available
             if not self._available(data[ATTR_SYSTEM]):
-                raise AddonNotSupportedError(
+                raise AppNotSupportedError(
                     f"Add-on {self.slug} is not available for this platform",
                     _LOGGER.error,
                 )
@@ -1428,7 +1428,7 @@ class Addon(AddonModel):
             # Restore local add-on information
             _LOGGER.info("Restore config for addon %s", self.slug)
             restore_image = self._image(data[ATTR_SYSTEM])
-            await self.sys_addons.data.restore(
+            await self.sys_apps.data.restore(
                 self.slug, data[ATTR_USER], data[ATTR_SYSTEM], restore_image
             )
 
@@ -1482,7 +1482,7 @@ class Addon(AddonModel):
                 try:
                     await self.sys_run_in_executor(_restore_data)
                 except shutil.Error as err:
-                    raise AddonsError(
+                    raise AppsError(
                         f"Can't restore origin data: {err}", _LOGGER.error
                     ) from err
 
@@ -1498,7 +1498,7 @@ class Addon(AddonModel):
                             "Can't restore AppArmor profile for add-on %s",
                             self.slug,
                         )
-                        raise AddonsError() from err
+                        raise AppsError from err
 
             finally:
                 # Is add-on loaded
@@ -1506,7 +1506,7 @@ class Addon(AddonModel):
                     await self.load()
 
                 # Run add-on
-                if data[ATTR_STATE] == AddonState.STARTED:
+                if data[ATTR_STATE] == AppState.STARTED:
                     wait_for_start = await self.start()
         finally:
             await self.sys_run_in_executor(tmp.cleanup)
@@ -1517,7 +1517,7 @@ class Addon(AddonModel):
         name="addon_restart_after_problem",
         throttle_period=WATCHDOG_THROTTLE_PERIOD,
         throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         throttle=JobThrottle.GROUP_RATE_LIMIT,
     )
     async def _restart_after_problem(self, state: ContainerState):
@@ -1540,7 +1540,7 @@ class Addon(AddonModel):
                         await (await self.start())
                     else:
                         await (await self.restart())
-                except AddonsError as err:
+                except AppsError as err:
                     attempts = attempts + 1
                     _LOGGER.error("Watchdog restart of addon %s failed!", self.name)
                     await async_capture_exception(err)
@@ -1573,17 +1573,17 @@ class Addon(AddonModel):
         if event.state == ContainerState.RUNNING:
             self._manual_stop = False
             self.state = (
-                AddonState.STARTUP if self.instance.healthcheck else AddonState.STARTED
+                AppState.STARTUP if self.instance.healthcheck else AppState.STARTED
             )
         elif event.state in [
             ContainerState.HEALTHY,
             ContainerState.UNHEALTHY,
         ]:
-            self.state = AddonState.STARTED
+            self.state = AppState.STARTED
         elif event.state == ContainerState.STOPPED:
-            self.state = AddonState.STOPPED
+            self.state = AppState.STOPPED
         elif event.state == ContainerState.FAILED:
-            self.state = AddonState.ERROR
+            self.state = AppState.ERROR
 
     async def watchdog_container(self, event: DockerContainerStateEvent) -> None:
         """Process state changes in addon container and restart if necessary."""

@@ -6,6 +6,7 @@ from pathlib import Path
 from awesomeversion import AwesomeVersion, AwesomeVersionException
 
 from ...const import CoreState
+from ..data import Issue
 from ...coresys import CoreSys
 from ..const import ContextType, IssueType, SuggestionType
 from .base import CheckBase
@@ -40,7 +41,7 @@ class CheckCoreSecurity(CheckBase):
         except (AwesomeVersionException, OSError):
             return
 
-    async def approve_check(self, reference: str | None = None) -> bool:
+    async def approve_check(self, issue: Issue) -> bool:
         """Approve check if it is affected by issue."""
         try:
             if self.sys_homeassistant.version >= AwesomeVersion("2021.1.5"):

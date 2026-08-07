@@ -10,7 +10,7 @@ import pytest
 from supervisor.addons.addon import Addon
 from supervisor.addons.build import AddonBuild
 from supervisor.arch import CpuArch
-from supervisor.const import AddonState
+from supervisor.const import AppState
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.const import ContainerState
@@ -36,7 +36,7 @@ async def test_addons_info(
     api_client: TestClient, coresys: CoreSys, install_addon_ssh: Addon
 ):
     """Test getting addon info."""
-    install_addon_ssh.state = AddonState.STOPPED
+    install_addon_ssh.state = AppState.STOPPED
     install_addon_ssh.ingress_panel = True
     install_addon_ssh.protected = True
     install_addon_ssh.watchdog = False
@@ -117,9 +117,9 @@ async def test_api_addon_start_healthcheck(
     container.attrs["Config"] = {"Healthcheck": "exists"}
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
-    state_changes: list[AddonState] = []
+    state_changes: list[AppState] = []
     _container_events_task: asyncio.Task | None = None
 
     async def container_events():
@@ -142,8 +142,8 @@ async def test_api_addon_start_healthcheck(
     with patch.object(DockerAddon, "run", new=container_events_task):
         resp = await api_client.post("/addons/local_ssh/start")
 
-    assert state_changes == [AddonState.STARTUP]
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert state_changes == [AppState.STARTUP]
+    assert install_addon_ssh.state == AppState.STARTED
     assert resp.status == 200
 
 
@@ -160,9 +160,9 @@ async def test_api_addon_restart_healthcheck(
     container.attrs["Config"] = {"Healthcheck": "exists"}
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STOPPED
+    assert install_addon_ssh.state == AppState.STOPPED
 
-    state_changes: list[AddonState] = []
+    state_changes: list[AppState] = []
     _container_events_task: asyncio.Task | None = None
 
     async def container_events():
@@ -185,8 +185,8 @@ async def test_api_addon_restart_healthcheck(
     with patch.object(DockerAddon, "run", new=container_events_task):
         resp = await api_client.post("/addons/local_ssh/restart")
 
-    assert state_changes == [AddonState.STARTUP]
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert state_changes == [AppState.STARTUP]
+    assert install_addon_ssh.state == AppState.STARTED
     assert resp.status == 200
 
 
@@ -205,9 +205,9 @@ async def test_api_addon_rebuild_healthcheck(
     container.attrs["Config"] = {"Healthcheck": "exists"}
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STARTUP
+    assert install_addon_ssh.state == AppState.STARTUP
 
-    state_changes: list[AddonState] = []
+    state_changes: list[AppState] = []
     _container_events_task: asyncio.Task | None = None
 
     async def container_events():
@@ -254,8 +254,8 @@ async def test_api_addon_rebuild_healthcheck(
     ):
         resp = await api_client.post("/addons/local_ssh/rebuild")
 
-    assert state_changes == [AddonState.STOPPED, AddonState.STARTUP]
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert state_changes == [AppState.STOPPED, AppState.STARTUP]
+    assert install_addon_ssh.state == AppState.STARTED
     assert resp.status == 200
 
 
@@ -274,9 +274,9 @@ async def test_api_addon_rebuild_force(
     container.attrs["Config"] = {"Healthcheck": "exists"}
     await install_addon_ssh.load()
     await asyncio.sleep(0)
-    assert install_addon_ssh.state == AddonState.STARTUP
+    assert install_addon_ssh.state == AppState.STARTUP
 
-    state_changes: list[AddonState] = []
+    state_changes: list[AppState] = []
     _container_events_task: asyncio.Task | None = None
 
     async def container_events():
@@ -344,8 +344,8 @@ async def test_api_addon_rebuild_force(
     ):
         resp = await api_client.post("/addons/local_ssh/rebuild", json={"force": True})
 
-    assert state_changes == [AddonState.STOPPED, AddonState.STARTUP]
-    assert install_addon_ssh.state == AddonState.STARTED
+    assert state_changes == [AppState.STOPPED, AppState.STARTUP]
+    assert install_addon_ssh.state == AppState.STARTED
     assert resp.status == 200
 
     await _container_events_task

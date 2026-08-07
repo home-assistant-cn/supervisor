@@ -3,7 +3,8 @@
 from datetime import timedelta
 import logging
 
-from ...const import AddonState, CoreState
+from ...const import AppState, CoreState
+from ..data import Issue
 from ...coresys import CoreSys
 from ...exceptions import PwnedConnectivityError, PwnedError, PwnedSecret
 from ...jobs.const import JobCondition, JobThrottle
@@ -35,7 +36,7 @@ class CheckAddonPwned(CheckBase):
             return
         await self.sys_homeassistant.secrets.reload()
 
-        for addon in self.sys_addons.installed:
+        for addon in self.sys_apps.installed:
             secrets = addon.pwned
             if not secrets:
                 continue
@@ -49,7 +50,7 @@ class CheckAddonPwned(CheckBase):
                     return
                 except PwnedSecret:
                     # Check possible suggestion
-                    if addon.state == AddonState.STARTED:
+                    if addon.state == AppState.STARTED:
                         suggestions = [SuggestionType.EXECUTE_STOP]
                     else:
                         suggestions = None
@@ -65,13 +66,13 @@ class CheckAddonPwned(CheckBase):
                     pass
 
     @Job(name="check_addon_pwned_approve", conditions=[JobCondition.INTERNET_SYSTEM])
-    async def approve_check(self, reference: str | None = None) -> bool:
+    async def approve_check(self, issue: Issue) -> bool:
         """Approve check if it is affected by issue."""
-        if not reference:
+        if not issue.reference:
             return False
 
         # Uninstalled
-        if not (addon := self.sys_addons.get_local_only(reference)):
+        if not (addon := self.sys_apps.get_local_only(issue.reference)):
             return False
 
         # Not in use anymore

@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from supervisor.addons.addon import Addon
-from supervisor.const import AddonState
+from supervisor.const import AppState
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.interface import DockerInterface
@@ -29,12 +29,12 @@ EXECUTE_RESTART_SUGGESTION = Suggestion(
 @pytest.mark.usefixtures("path_extern")
 async def test_fixup(coresys: CoreSys, install_addon_ssh: Addon):
     """Test fixup restarts addon."""
-    install_addon_ssh.state = AddonState.STARTED
+    install_addon_ssh.state = AppState.STARTED
     addon_execute_restart = FixupAddonExecuteRestart(coresys)
     assert addon_execute_restart.auto is False
 
     async def mock_stop(*args, **kwargs):
-        install_addon_ssh.state = AddonState.STOPPED
+        install_addon_ssh.state = AppState.STOPPED
 
     coresys.resolution.add_issue(
         DEVICE_ACCESS_MISSING_ISSUE,
@@ -59,7 +59,7 @@ async def test_fixup_stop_error(
     coresys: CoreSys, install_addon_ssh: Addon, caplog: pytest.LogCaptureFixture
 ):
     """Test fixup fails on stop addon failure."""
-    install_addon_ssh.state = AddonState.STARTED
+    install_addon_ssh.state = AppState.STARTED
     addon_execute_start = FixupAddonExecuteRestart(coresys)
 
     coresys.resolution.add_issue(
@@ -83,7 +83,7 @@ async def test_fixup_start_error(
     coresys: CoreSys, install_addon_ssh: Addon, caplog: pytest.LogCaptureFixture
 ):
     """Test fixup logs a start addon failure."""
-    install_addon_ssh.state = AddonState.STARTED
+    install_addon_ssh.state = AppState.STARTED
     addon_execute_start = FixupAddonExecuteRestart(coresys)
 
     coresys.resolution.add_issue(

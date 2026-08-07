@@ -9,12 +9,12 @@ from typing import Self, Union
 
 from attr import evolve
 
-from ..const import AddonBoot, AddonStartup, AddonState
+from ..const import AppBoot, AppStartup, AppState
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
-    AddonNotSupportedError,
-    AddonsError,
-    AddonsJobError,
+    AppNotSupportedError,
+    AppsError,
+    AppsJobError,
     CoreDNSError,
     DockerError,
     HassioError,
@@ -104,11 +104,11 @@ class AddonManager(CoreSysAttributes):
         # Sync DNS
         await self.sync_dns()
 
-    async def boot(self, stage: AddonStartup) -> None:
+    async def boot(self, stage: AppStartup) -> None:
         """Boot add-ons with mode auto."""
         tasks: list[Addon] = []
         for addon in self.installed:
-            if addon.boot != AddonBoot.AUTO or addon.startup != stage:
+            if addon.boot != AppBoot.AUTO or addon.startup != stage:
                 continue
             tasks.append(addon)
 
@@ -146,7 +146,7 @@ class AddonManager(CoreSysAttributes):
         # Ignore stopped as single shot addons can be run at boot and this is successful exit
         # Timeout waiting for startup is not a failure, addon is probably just slow
         for addon in tasks:
-            if addon.state in {AddonState.ERROR, AddonState.UNKNOWN}:
+            if addon.state in {AppState.ERROR, AppState.UNKNOWN}:
                 self.sys_resolution.add_issue(
                     evolve(addon.boot_failed_issue),
                     suggestions=[
@@ -155,11 +155,11 @@ class AddonManager(CoreSysAttributes):
                     ],
                 )
 
-    async def shutdown(self, stage: AddonStartup) -> None:
+    async def shutdown(self, stage: AppStartup) -> None:
         """Shutdown addons."""
         tasks: list[Addon] = []
         for addon in self.installed:
-            if addon.state != AddonState.STARTED or addon.startup != stage:
+            if addon.state != AppState.STARTED or addon.startup != stage:
                 continue
             tasks.append(addon)
 
@@ -180,7 +180,7 @@ class AddonManager(CoreSysAttributes):
     @Job(
         name="addon_manager_install",
         conditions=ADDON_UPDATE_CONDITIONS,
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         concurrency=JobConcurrency.QUEUE,
         child_job_syncs=[
             ChildJobSyncFilter("docker_interface_install", progress_allocation=1.0)
@@ -193,11 +193,11 @@ class AddonManager(CoreSysAttributes):
         self.sys_jobs.current.reference = slug
 
         if slug in self.local:
-            raise AddonsError(f"Add-on {slug} is already installed", _LOGGER.warning)
+            raise AppsError(f"Add-on {slug} is already installed", _LOGGER.warning)
         store = self.store.get(slug)
 
         if not store:
-            raise AddonsError(f"Add-on {slug} does not exist", _LOGGER.error)
+            raise AppsError(f"Add-on {slug} does not exist", _LOGGER.error)
 
         store.validate_availability()
 
@@ -231,7 +231,7 @@ class AddonManager(CoreSysAttributes):
     @Job(
         name="addon_manager_update",
         conditions=ADDON_UPDATE_CONDITIONS,
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
         # We assume for now the docker image pull is 100% of this task for progress
         # allocation. But from a user perspective that isn't true. Other steps
         # that take time which is not accounted for in progress include:
@@ -255,17 +255,17 @@ class AddonManager(CoreSysAttributes):
         self.sys_jobs.current.reference = slug
 
         if slug not in self.local:
-            raise AddonsError(f"Add-on {slug} is not installed", _LOGGER.error)
+            raise AppsError(f"Add-on {slug} is not installed", _LOGGER.error)
         addon = self.local[slug]
 
         if addon.is_detached:
-            raise AddonsError(
+            raise AppsError(
                 f"Add-on {slug} is not available inside store", _LOGGER.error
             )
         store = self.store[slug]
 
         if addon.version == store.version:
-            raise AddonsError(f"No update available for add-on {slug}", _LOGGER.warning)
+            raise AppsError(f"No update available for add-on {slug}", _LOGGER.warning)
 
         # Check if available, Maybe something have changed
         store.validate_availability()
@@ -293,7 +293,7 @@ class AddonManager(CoreSysAttributes):
             JobCondition.INTERNET_HOST,
             JobCondition.HEALTHY,
         ],
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
     )
     async def rebuild(self, slug: str, *, force: bool = False) -> asyncio.Task | None:
         """Perform a rebuild of local build add-on.
@@ -304,22 +304,22 @@ class AddonManager(CoreSysAttributes):
         self.sys_jobs.current.reference = slug
 
         if slug not in self.local:
-            raise AddonsError(f"Add-on {slug} is not installed", _LOGGER.error)
+            raise AppsError(f"Add-on {slug} is not installed", _LOGGER.error)
         addon = self.local[slug]
 
         if addon.is_detached:
-            raise AddonsError(
+            raise AppsError(
                 f"Add-on {slug} is not available inside store", _LOGGER.error
             )
         store = self.store[slug]
 
         # Check if a rebuild is possible now
         if addon.version != store.version:
-            raise AddonsError(
+            raise AppsError(
                 "Version changed, use Update instead Rebuild", _LOGGER.error
             )
         if not force and not addon.need_build:
-            raise AddonNotSupportedError(
+            raise AppNotSupportedError(
                 "Can't rebuild a image based add-on", _LOGGER.error
             )
 
@@ -332,7 +332,7 @@ class AddonManager(CoreSysAttributes):
             JobCondition.INTERNET_HOST,
             JobCondition.HEALTHY,
         ],
-        on_condition=AddonsJobError,
+        on_condition=AppsJobError,
     )
     async def restore(
         self, slug: str, tar_file: tarfile.TarFile
@@ -402,7 +402,7 @@ class AddonManager(CoreSysAttributes):
                         continue
 
             _LOGGER.error("Can't repair %s", addon.slug)
-            with suppress(AddonsError):
+            with suppress(AppsError):
                 await self.uninstall(addon.slug)
 
     async def sync_dns(self) -> None:

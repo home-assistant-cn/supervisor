@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="557cfb5e-7b6d-4944-b64e-b990c82e9947" name="更改" comment="同步2025.11.4" />
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;ydshk&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/home-assistant-cn/supervisor.git&quot;,
+    &quot;accountId&quot;: &quot;83178b77-9056-497e-8692-131533860b6a&quot;
+  }
+}</component>
+  <component name="ProjectColorInfo">{
+  &quot;customColor&quot;: &quot;&quot;,
+  &quot;associatedIndex&quot;: 6
+}</component>
+  <component name="ProjectId" id="34zkLK9TLxpmn3twtZNVCQasCW2" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "sync-2026.07.5"
+  }
+}]]></component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-164cda30dcd9-0af03a5fa574-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-252.26830.99" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="默认任务">
+      <changelist id="557cfb5e-7b6d-4944-b64e-b990c82e9947" name="更改" comment="" />
+      <created>1762223732653</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1762223732653</updated>
+    </task>
+    <task id="LOCAL-00001" summary="同步2025.11.1">
+      <option name="closed" value="true" />
+      <created>1762223790696</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1762223790696</updated>
+    </task>
+    <task id="LOCAL-00002" summary="同步2025.11.2">
+      <option name="closed" value="true" />
+      <created>1762930583272</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1762930583272</updated>
+    </task>
+    <task id="LOCAL-00003" summary="同步2025.11.3">
+      <option name="closed" value="true" />
+      <created>1763622482450</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1763622482450</updated>
+    </task>
+    <task id="LOCAL-00004" summary="同步2025.11.4">
+      <option name="closed" value="true" />
+      <created>1763629256271</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1763629256271</updated>
+    </task>
+    <task id="LOCAL-00005" summary="同步2025.11.4">
+      <option name="closed" value="true" />
+      <created>1763629631062</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1763629631062</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
+    <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="同步2025.11.1" />
+    <MESSAGE value="同步2025.11.2" />
+    <MESSAGE value="同步2025.11.3" />
+    <MESSAGE value="同步2025.11.4" />
+    <option name="LAST_COMMIT_MESSAGE" value="同步2025.11.4" />
+  </component>
+</project>

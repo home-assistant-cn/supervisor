@@ -3,7 +3,7 @@
 # pylint: disable=import-error,protected-access
 from unittest.mock import AsyncMock, patch
 
-from supervisor.const import AddonState, CoreState
+from supervisor.const import AppState, CoreState
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import PwnedSecret
 from supervisor.resolution.checks.addon_pwned import CheckAddonPwned
@@ -15,7 +15,7 @@ class TestAddon:
 
     slug = "my_test"
     pwned = set()
-    state = AddonState.STARTED
+    state = AppState.STARTED
     is_installed = True
 
 

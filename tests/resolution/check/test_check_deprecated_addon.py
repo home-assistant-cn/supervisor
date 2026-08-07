@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 from supervisor.addons.addon import Addon
-from supervisor.const import AddonStage, CoreState
+from supervisor.const import AppStage, CoreState
 from supervisor.coresys import CoreSys
 from supervisor.resolution.checks.deprecated_addon import CheckDeprecatedAddon
 from supervisor.resolution.const import ContextType, IssueType
@@ -25,7 +25,7 @@ async def test_check(coresys: CoreSys, install_addon_ssh: Addon):
     assert len(coresys.resolution.issues) == 0
 
     # Mock test addon as deprecated
-    install_addon_ssh.data["stage"] = AddonStage.DEPRECATED
+    install_addon_ssh.data["stage"] = AppStage.DEPRECATED
 
     await deprecated_addon()
 
@@ -46,7 +46,7 @@ async def test_approve(coresys: CoreSys, install_addon_ssh: Addon):
     )
 
     # Mock test addon as deprecated
-    install_addon_ssh.data["stage"] = AddonStage.DEPRECATED
+    install_addon_ssh.data["stage"] = AppStage.DEPRECATED
 
     assert (
         await deprecated_addon.approve_check(reference=install_addon_ssh.slug) is True

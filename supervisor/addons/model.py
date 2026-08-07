@@ -83,18 +83,18 @@ from ..const import (
     SECURITY_DEFAULT,
     SECURITY_DISABLE,
     SECURITY_PROFILE,
-    AddonBoot,
-    AddonBootConfig,
-    AddonStage,
-    AddonStartup,
+    AppBoot,
+    AppBootConfig,
+    AppStage,
+    AppStartup,
 )
 from ..coresys import CoreSys
 from ..docker.const import Capabilities
 from ..exceptions import (
-    AddonNotSupportedArchitectureError,
-    AddonNotSupportedError,
-    AddonNotSupportedHomeAssistantVersionError,
-    AddonNotSupportedMachineTypeError,
+    AppNotSupportedArchitectureError,
+    AppNotSupportedError,
+    AppNotSupportedHomeAssistantVersionError,
+    AppNotSupportedMachineTypeError,
 )
 from ..jobs.const import JOB_GROUP_ADDON
 from ..jobs.job_group import JobGroup
@@ -156,14 +156,14 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_OPTIONS]
 
     @property
-    def boot_config(self) -> AddonBootConfig:
+    def boot_config(self) -> AppBootConfig:
         """Return boot config."""
         return self.data[ATTR_BOOT]
 
     @property
-    def boot(self) -> AddonBoot:
+    def boot(self) -> AppBoot:
         """Return boot config with prio local settings unless config is forced."""
-        return AddonBoot(self.data[ATTR_BOOT])
+        return AppBoot(self.data[ATTR_BOOT])
 
     @property
     def auto_update(self) -> bool | None:
@@ -246,7 +246,7 @@ class AddonModel(JobGroup, ABC):
         return True
 
     @property
-    def startup(self) -> AddonStartup:
+    def startup(self) -> AppStartup:
         """Return startup type of add-on."""
         return self.data[ATTR_STARTUP]
 
@@ -256,7 +256,7 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_ADVANCED]
 
     @property
-    def stage(self) -> AddonStage:
+    def stage(self) -> AppStage:
         """Return stage mode of add-on."""
         return self.data[ATTR_STAGE]
 
@@ -685,7 +685,7 @@ class AddonModel(JobGroup, ABC):
         """Validate if addon is available for current system."""
         # Architecture
         if not self.sys_arch.is_supported(config[ATTR_ARCH]):
-            raise AddonNotSupportedArchitectureError(
+            raise AppNotSupportedArchitectureError(
                 logger, slug=self.slug, architectures=config[ATTR_ARCH]
             )
 
@@ -694,7 +694,7 @@ class AddonModel(JobGroup, ABC):
         if machine and (
             f"!{self.sys_machine}" in machine or self.sys_machine not in machine
         ):
-            raise AddonNotSupportedMachineTypeError(
+            raise AppNotSupportedMachineTypeError(
                 logger, slug=self.slug, machine_types=machine
             )
 
@@ -704,7 +704,7 @@ class AddonModel(JobGroup, ABC):
             if version and not version_is_new_enough(
                 self.sys_homeassistant.version, version
             ):
-                raise AddonNotSupportedHomeAssistantVersionError(
+                raise AppNotSupportedHomeAssistantVersionError(
                     logger, slug=self.slug, version=str(version)
                 )
 
@@ -712,7 +712,7 @@ class AddonModel(JobGroup, ABC):
         """Return True if this add-on is available on this platform."""
         try:
             self._validate_availability(config)
-        except AddonNotSupportedError:
+        except AppNotSupportedError:
             return False
 
         return True

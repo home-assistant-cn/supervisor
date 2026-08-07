@@ -94,8 +94,8 @@ from ..const import (
     ATTR_WATCHDOG,
     ATTR_WEBUI,
     REQUEST_FROM,
-    AddonBoot,
-    AddonBootConfig,
+    AppBoot,
+    AppBootConfig,
 )
 from ..coresys import CoreSysAttributes
 from ..docker.stats import DockerStats
@@ -118,7 +118,7 @@ SCHEMA_VERSION = vol.Schema({vol.Optional(ATTR_VERSION): str})
 # pylint: disable=no-value-for-parameter
 SCHEMA_OPTIONS = vol.Schema(
     {
-        vol.Optional(ATTR_BOOT): vol.Coerce(AddonBoot),
+        vol.Optional(ATTR_BOOT): vol.Coerce(AppBoot),
         vol.Optional(ATTR_NETWORK): vol.Maybe(docker_ports),
         vol.Optional(ATTR_AUTO_UPDATE): vol.Boolean(),
         vol.Optional(ATTR_AUDIO_OUTPUT): vol.Maybe(str),
@@ -167,7 +167,7 @@ class APIAddons(CoreSysAttributes):
                 raise APIError("Self is not an Addon")
             return addon
 
-        addon = self.sys_addons.get(addon_slug)
+        addon = self.sys_apps.get(addon_slug)
         if not addon:
             raise APINotFound(f"Addon {addon_slug} does not exist")
         if not isinstance(addon, Addon) or not addon.is_installed:
@@ -199,7 +199,7 @@ class APIAddons(CoreSysAttributes):
                 ATTR_LOGO: addon.with_logo,
                 ATTR_SYSTEM_MANAGED: addon.system_managed,
             }
-            for addon in self.sys_addons.installed
+            for addon in self.sys_apps.installed
         ]
 
         return {ATTR_ADDONS: data_addons}
@@ -310,7 +310,7 @@ class APIAddons(CoreSysAttributes):
         if ATTR_OPTIONS in body:
             addon.options = body[ATTR_OPTIONS]
         if ATTR_BOOT in body:
-            if addon.boot_config == AddonBootConfig.MANUAL_ONLY:
+            if addon.boot_config == AppBootConfig.MANUAL_ONLY:
                 raise APIError(
                     f"Addon {addon.slug} boot option is set to {addon.boot_config} so it cannot be changed"
                 )
@@ -435,7 +435,7 @@ class APIAddons(CoreSysAttributes):
         addon = self.get_addon_for_request(request)
         body: dict[str, Any] = await api_validate(SCHEMA_UNINSTALL, request)
         return await asyncio.shield(
-            self.sys_addons.uninstall(
+            self.sys_apps.uninstall(
                 addon.slug, remove_config=body[ATTR_REMOVE_CONFIG]
             )
         )
@@ -467,7 +467,7 @@ class APIAddons(CoreSysAttributes):
         body: dict[str, Any] = await api_validate(SCHEMA_REBUILD, request)
 
         if start_task := await asyncio.shield(
-            self.sys_addons.rebuild(addon.slug, force=body[ATTR_FORCE])
+            self.sys_apps.rebuild(addon.slug, force=body[ATTR_FORCE])
         ):
             await start_task
 
