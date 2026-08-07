@@ -8,7 +8,7 @@
    ![](/images/shell1.png)
 ```shell
 cd /mnt/data/
-curl -sSL https://os-artifacts.smart-assistant.cn/ha -o ha && sh ha
+curl -sSL https://os-artifacts.home-assistant.xin/ha -o ha && sh ha
 ```
 ### 或
 可以通过在HAOS Shell的根访问直接运行以下命令
@@ -16,13 +16,13 @@ curl -sSL https://os-artifacts.smart-assistant.cn/ha -o ha && sh ha
    ![](/images/shell2.png)
 ```shell
 cd /mnt/data/
-curl -sSL https://os-artifacts.smart-assistant.cn/ha -o /mnt/data/ha && sh /mnt/data/ha
+curl -sSL https://os-artifacts.home-assistant.xin/ha -o /mnt/data/ha && sh /mnt/data/ha
 ```
 ### 下面方法是切换 Home Assistant OS 和 Supervisor 命令
 此命令只能通过 Home Assistant OS Shell 
 ```shell
 cd /mnt/data/
-curl -sSL https://os-artifacts.smart-assistant.cn/haos -o /mnt/data/haos && sh /mnt/data/haos
+curl -sSL https://os-artifacts.home-assistant.xin/haos -o /mnt/data/haos && sh /mnt/data/haos
 ```
 ### 2. 使用 Advanced SSH & Web Terminal
     安装步骤：
@@ -37,7 +37,7 @@ curl -sSL https://os-artifacts.smart-assistant.cn/haos -o /mnt/data/haos && sh /
     -配置>ssh 设置用户名和密码
    ![](/images/ssh1.png)
 ```shell
-curl -sSL https://os-artifacts.smart-assistant.cn/ha -o ha && sh ha
+curl -sSL https://os-artifacts.home-assistant.xin/ha -o ha && sh ha
 ```
 ### 3. 使用 Portainer 网页断切换
 添加方法自行百度
