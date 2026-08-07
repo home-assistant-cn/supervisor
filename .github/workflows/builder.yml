@@ -214,7 +214,7 @@ jobs:
       # Push to Aliyun ACR (Chinese mirror)
       - name: Login to cn Container Registry
         if: needs.init.outputs.publish == 'true'
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ secrets.CN_REGISTRY }}
           username: ${{ secrets.CN_REGISTRY_USERNAME }}
