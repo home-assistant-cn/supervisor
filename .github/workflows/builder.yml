@@ -22,15 +22,15 @@ on:
     branches: ["main"]
   release:
     types: ["published"]
-  push:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/builder.yml"
-      - "rootfs/**"
-      - "supervisor/**"
-      - Dockerfile
-      - requirements.txt
-      - setup.py
+#  push:
+#    branches: ["main"]
+#    paths:
+#      - ".github/workflows/builder.yml"
+#      - "rootfs/**"
+#      - "supervisor/**"
+#      - Dockerfile
+#      - requirements.txt
+#      - setup.py
 
 env:
   DEFAULT_PYTHON: "3.14.6"
@@ -117,7 +117,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Chinese source replacements
+      - name: Write env-file for wheels build
+        if: needs.init.outputs.build_wheels == 'true'
+        run: |
+          (
+            # Fix out of memory issues with rust
+            echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"
+          ) > .env_file
+
       - name: Set source
         run: |
           sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
@@ -127,14 +134,6 @@ jobs:
           sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
           sed -i ${{ vars.SENTRY_SOURCE }} supervisor/utils/sentry.py
           sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
-
-      - name: Write env-file for wheels build
-        if: needs.init.outputs.build_wheels == 'true'
-        run: |
-          (
-            # Fix out of memory issues with rust
-            echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"
-          ) > .env_file
 
       - name: Build and publish wheels
         if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true'
@@ -211,33 +210,6 @@ jobs:
           push: ${{ needs.init.outputs.publish == 'true' }}
           version: ${{ needs.init.outputs.version }}
 
-      # Push to Aliyun ACR (Chinese mirror)
-      - name: Login to cn Container Registry
-        if: needs.init.outputs.publish == 'true'
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
-        with:
-          registry: ${{ secrets.CN_REGISTRY }}
-          username: ${{ secrets.CN_REGISTRY_USERNAME }}
-          password: ${{ secrets.CN_REGISTRY_PASSWORD }}
-
-      - name: Retag and push to cn ACR
-        if: needs.init.outputs.publish == 'true'
-        run: |
-          ALIYUN_BASE="registry.cn-hangzhou.aliyuncs.com/home-assistant-cn"
-
-          ALIYUN_VERSION="${ALIYUN_BASE}/${{ matrix.arch }}-hassio-supervisor:${{ needs.init.outputs.version }}"
-          ALIYUN_LATEST="${ALIYUN_BASE}/${{ matrix.arch }}-hassio-supervisor:latest"
-
-          docker pull ${{ matrix.image }}:${{ needs.init.outputs.version }}
-          docker tag ${{ matrix.image }}:${{ needs.init.outputs.version }} $ALIYUN_VERSION
-          docker tag ${{ matrix.image }}:${{ needs.init.outputs.version }} $ALIYUN_LATEST
-
-          echo "Pushing version tag: ${ALIYUN_VERSION}"
-          docker push ${ALIYUN_VERSION}
-
-          echo "Pushing latest tag: ${ALIYUN_LATEST}"
-          docker push ${ALIYUN_LATEST}
-
   manifest:
     name: Publish multi-arch manifest
     needs: ["init", "build"]
@@ -259,7 +231,7 @@ jobs:
 
   version:
     name: Update version
-    if: github.repository_owner == 'home-assistant-cn' && needs.init.outputs.publish == 'true'
+    if: github.repository_owner == 'home-assistant' && needs.init.outputs.publish == 'true'
     needs: ["init", "run_supervisor"]
     runs-on: ubuntu-latest
     steps:
@@ -295,8 +267,6 @@ jobs:
         with:
           name: wheels-amd64
           path: wheels
-
-      # Chinese source replacements
       - name: Set source
         run: |
           sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
