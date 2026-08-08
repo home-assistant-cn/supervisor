@@ -116,14 +116,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
       # Chinese source replacements
       - name: Set source
         run: |
           sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
           sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
+          sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
           sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
-          sed -i '/^from __future__/a import requests' supervisor/docker/interface.py
-          sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
+          sed -i ${{ vars.SENTRY_SOURCE }} supervisor/utils/sentry.py
+          sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
 
       - name: Write env-file for wheels build
         if: needs.init.outputs.build_wheels == 'true'
@@ -258,9 +260,10 @@ jobs:
         run: |
           sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
           sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
+          sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
           sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
-          sed -i '/^from __future__/a import requests' supervisor/docker/interface.py
-          sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
+          sed -i ${{ vars.SENTRY_SOURCE }} supervisor/utils/sentry.py
+          sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
 
       # Build the Supervisor for non-publish runs (e.g. PRs)
       - name: Build the Supervisor
