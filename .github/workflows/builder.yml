@@ -22,15 +22,15 @@ on:
     branches: ["main"]
   release:
     types: ["published"]
-#  push:
-#    branches: ["main"]
-#    paths:
-#      - ".github/workflows/builder.yml"
-#      - "rootfs/**"
-#      - "supervisor/**"
-#      - Dockerfile
-#      - requirements.txt
-#      - setup.py
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/builder.yml"
+      - "rootfs/**"
+      - "supervisor/**"
+      - Dockerfile
+      - requirements.txt
+      - setup.py
 
 env:
   DEFAULT_PYTHON: "3.14.6"
@@ -117,6 +117,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Chinese source replacements
+      - name: Set source
+        run: |
+          sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
+          sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
+          sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
+          sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
+          sed -i '1i import requests' supervisor/docker/interface.py
+          sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
+          sed -i ${{ vars.SENTRY_SOURCE }} supervisor/utils/sentry.py
+          sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
+
       - name: Write env-file for wheels build
         if: needs.init.outputs.build_wheels == 'true'
         run: |
@@ -124,16 +136,6 @@ jobs:
             # Fix out of memory issues with rust
             echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"
           ) > .env_file
-
-      - name: Set source
-        run: |
-          sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
-          sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
-          sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
-          sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
-          sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
-          sed -i ${{ vars.SENTRY_SOURCE }} supervisor/utils/sentry.py
-          sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
 
       - name: Build and publish wheels
         if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true'
@@ -231,7 +233,7 @@ jobs:
 
   version:
     name: Update version
-    if: github.repository_owner == 'home-assistant' && needs.init.outputs.publish == 'true'
+    if: github.repository_owner == 'home-assistant-cn' && needs.init.outputs.publish == 'true'
     needs: ["init", "run_supervisor"]
     runs-on: ubuntu-latest
     steps:
@@ -239,14 +241,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize git
-        uses: home-assistant-cn/actions/helpers/git-init@master
+        uses: home-assistant/actions/helpers/git-init@master
         with:
           name: ${{ secrets.GIT_NAME }}
           email: ${{ secrets.GIT_EMAIL }}
           token: ${{ secrets.GIT_TOKEN }}
 
       - name: Update version file
-        uses: home-assistant-cn/actions/helpers/version-push@master
+        uses: home-assistant/actions/helpers/version-push@master
         with:
           key: ${{ env.BUILD_NAME }}
           version: ${{ needs.init.outputs.version }}
@@ -267,12 +269,15 @@ jobs:
         with:
           name: wheels-amd64
           path: wheels
+
+      # Chinese source replacements
       - name: Set source
         run: |
           sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
           sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
           sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
           sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
+          sed -i '1i import requests' supervisor/docker/interface.py
           sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
           sed -i ${{ vars.SENTRY_SOURCE }} supervisor/utils/sentry.py
           sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
